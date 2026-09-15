@@ -31,4 +31,4 @@ async def run_turn(phone_number: str, message: str) -> str:
     result = await orchestrator.ainvoke(
         {"messages": [HumanMessage(content=message)]}, config=config
     )
-    return result["messages"][-1].content
+    return result["messages"][-1].text

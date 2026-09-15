@@ -8,39 +8,23 @@ Phase 1 alongside PostgresSaver).
 Run: .venv/Scripts/python.exe scripts/check_db.py
 """
 
-import socket
 import sys
 from pathlib import Path
-from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import psycopg
 
 from src.config import DATABASE_URL
+from src.db.conninfo import ipv4_conninfo
 
 SCHEMA_PATH = Path(__file__).resolve().parent.parent / "src" / "db" / "schema.sql"
-
-
-def _connect_kwargs() -> dict:
-    """Force IPv4 for the Neon host.
-
-    This machine's DNS returns AAAA records for the Neon pooler, but has no
-    working outbound IPv6 route — a plain psycopg.connect(DATABASE_URL) hangs
-    (TCP SYN silently dropped) instead of failing fast. Resolving the A
-    record ourselves and passing it as `hostaddr` skips libpq's own DNS
-    resolution while `host` is kept for the TLS/SCRAM channel binding Neon
-    requires.
-    """
-    host = urlparse(DATABASE_URL).hostname
-    ipv4 = socket.getaddrinfo(host, None, socket.AF_INET)[0][4][0]
-    return {"hostaddr": ipv4, "connect_timeout": 10}
 
 
 def main() -> None:
     schema_sql = SCHEMA_PATH.read_text()
 
-    with psycopg.connect(DATABASE_URL, **_connect_kwargs()) as conn:
+    with psycopg.connect(ipv4_conninfo(DATABASE_URL), connect_timeout=10) as conn:
         with conn.cursor() as cur:
             cur.execute(schema_sql)
         conn.commit()

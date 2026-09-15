@@ -1,8 +1,8 @@
 # Build Plan — Kapruka Gift Concierge (v1)
 
-**Status: v2 rebuild in progress — Phase 0 and Phase 1 complete (this
-directory started empty: no repo, no venv, no source — only
-`.env`/`CLAUDE.md`/`PLAN.md`/`docs/` carried over). Everything from Phase 2
+**Status: v2 rebuild in progress — Phases 0-2 complete (this directory
+started empty: no repo, no venv, no source — only
+`.env`/`CLAUDE.md`/`PLAN.md`/`docs/` carried over). Everything from Phase 3
 onward in this file is still the narrative from the earlier build, kept as
 design-decision history — that code does not exist yet in `v2` and needs to
 be rebuilt phase by phase.**
@@ -149,97 +149,135 @@ above): `src/prompts.py`, `src/session.py`, `src/router/intent_router.py`,
         answer it)
       - "what can you do?", "thanks, bye!" → `chitchat`, not `out_of_scope`
 
-## Phase 2 — Gift-Picker Agent (built and tested in isolation)
-- [x] LangGraph LangGraph agent node wired to an `MultiServerMCPClient` (tool selection scoped to
-      `search_products` / `get_product` / `list_categories` only — not
-      `check_delivery` / `create_order` / `track_order`) —
-      `src/gift_picker/agent.py::build_gift_picker_agent`.
-- [x] Custom `get_recipient_profile` tool against the `recipients` table
-      (`src/gift_picker/tools.py`, DB access in `src/db/recipients.py`) —
-      matches loosely on name OR relationship (e.g. "mom" finds
-      relationship="mother"), returns `{"matches": [...]}` and lets the
-      model decide/ask rather than forcing a single-best-match heuristic
-      in Python.
-- [x] **Full conversation history for this agent.** Resolved by removing
-      the history bound from the *top-level* graph invocation in `main.py`
-      entirely (it now defaults to full history for every turn) rather
-      than trying to keep the Router bounded within a shared context —
-      see the long comment at the top of `src/orchestrator.py` for why
-      that turned out to be the only workable option once router and
-      Gift-Picker share one shared graph state. `classify_intent()`'s own
-      standalone bounded path is untouched, for isolated router testing.
-- [x] `propose_cart` as a plain LangChain `@tool`, not structured output —
-      `src/gift_picker/tools.py::propose_cart`. Writes
-      `{items, estimated_total, notes}` into `tool_context.state['cart']`
-      and clears `product_suggestions` in the same call.
-- [x] `propose_cart` docstring written with explicit timing guidance
-      ("only once confident and concrete... not to tentatively summarize
-      progress"). **Verified working, not just written**: live test
-      correctly withheld the cart on a first turn showing 4 candidate
-      products and asking a follow-up, then proposed a 2-item cart with
-      correct IDs/prices/total once the customer picked specific items —
-      see verification note below.
-- [x] `suggest_products` as a second plain LangChain `@tool` —
-      `src/gift_picker/tools.py::suggest_products`. Maps the live API's
-      `id` field to `product_id` per the field-name note in the docstring
-      and in `GIFT_PICKER_INSTRUCTIONS`.
-- [x] `product_suggestions` reset structurally, not by instruction — the
-      orchestrator yields its own a graph state update
-      {"product_suggestions": []}))` immediately before invoking the
-      Gift-Picker sub-agent, confirmed (via reading the LangGraph state-update/checkpoint behavior)
-      to persist through `append_event` and be visible on graph state
-      by the time the sub-agent runs, same turn.
+## Phase 2 — Gift-Picker Agent (rebuilt and tested for v2, 2026-09-15)
+Rebuilt from scratch: `src/gift_picker/{agent,tools,state}.py`,
+`src/db/recipients.py`, `src/db/conninfo.py` (promoted out of
+`src/session.py` — both the checkpointer and the new recipients connection
+pool needed the same IPv4-forcing fix from Phase 0).
+
+- [x] The only real ReAct loop in the system — `create_agent` wired to the
+      Kapruka MCP tools via `MultiServerMCPClient`, filtered to
+      `kapruka_search_products` / `kapruka_get_product` /
+      `kapruka_list_categories` only (never `check_delivery`/`create_order`/
+      `track_order`) — `src/gift_picker/agent.py::build_gift_picker_agent`.
+      The scoped tool list is cached (network round-trip to list them is
+      unnecessary every turn).
+- [x] Custom `get_recipient_profile` tool (`src/gift_picker/tools.py`) — DB
+      access in `src/db/recipients.py` (async psycopg pool). Matches loosely
+      on name OR relationship via `ILIKE`; when that comes back empty,
+      falls back to the customer's *full* recipient list rather than a
+      hardcoded alias table (e.g. "mom" vs a stored `relationship="mother"`)
+      — lets the model do the semantic matching instead of Python. Returns
+      `{"matches": [...]}`, never a forced single best match. Scoped to the
+      caller's own `phone_number`, read out of `RunnableConfig` (LangChain's
+      built-in "a parameter typed exactly `RunnableConfig` gets
+      auto-injected" mechanism) rather than trusting the model to pass its
+      own phone number.
+- [x] **Full conversation history for this agent** — true by construction:
+      the top-level orchestrator invocation was never bounded to begin with
+      (see Phase 1), so there was nothing to undo here.
+- [x] `propose_cart` as a plain `@tool` returning `Command(update={"cart":
+      ..., "product_suggestions": [], "messages": [...]})` —
+      `src/gift_picker/tools.py::propose_cart`. Schema includes
+      `delivery_city`/`delivery_date` from day one (the v1 build added these
+      later as a "retroactive amendment"; built in here since the need was
+      already known).
+- [x] `propose_cart` docstring carries explicit timing guidance ("ONLY once
+      you and the customer have converged on specific items... not to
+      tentatively summarize progress"). **Verified live, not just written**
+      — see the explicit-products test below.
+- [x] `suggest_products` as a second plain `@tool` — maps the live API's
+      `id` field to `product_id` per the field-name note in both the
+      docstring and `GIFT_PICKER_INSTRUCTIONS`; verified live (all returned
+      items correctly carried `product_id`, never raw `id`).
+- [x] `product_suggestions` reset structurally, not left to the model —
+      `_reset_before_gift_picker` (`src/orchestrator.py`) returns
+      `{"product_suggestions": [], "cart_snapshot": state.get("cart")}` as
+      its own graph step immediately before the Gift-Picker node runs, so
+      the reset is committed and visible by the time it does.
 - [x] `GIFT_PICKER_INSTRUCTIONS` (`src/prompts.py`) encodes the full
       decision policy: check `get_recipient_profile` before asking about a
       named recipient, search eagerly on partial info, never describe a
       product without having looked it up, combine "found"/"still need" in
       one reply, `suggest_products` before describing by name,
       `propose_cart` only once concrete.
-- [x] Orchestrator-side dispatch (`src/orchestrator.py::_run_gift_picker`):
-      scans the Gift-Picker sub-agent's own yielded events for a `"cart"`
-      key in `the node's returned state update` (precise "did propose_cart fire
-      this turn" signal — robust to a stale `cart` already sitting in
-      state from an earlier turn, unlike a plain before/after key-presence
-      check). Present → stub note (Phase 3 doesn't exist yet, matching the
-      Phase 1 stub precedent for `track_order`/`return_item`). Absent →
-      relay the Gift-Picker's own final text, console-print
-      `product_suggestions` as a stand-in for "cards" (no real UI yet).
+- [x] **Orchestrator-side dispatch, redesigned from the v1 plan's own
+      approach.** The Gift-Picker is embedded as a real subgraph node
+      (`graph.add_node("gift_picker", await build_gift_picker_agent())`),
+      sharing `messages`/`product_suggestions`/`cart` with `ConciergeState`
+      via matching field names (`src/gift_picker/state.py`) — same
+      mechanism Phase 1 uses for the router. Detecting "did `propose_cart`
+      fire THIS turn" (not a stale cart from an earlier turn) is done by
+      **snapshotting `cart` immediately before the Gift-Picker runs and
+      diffing it against `cart` immediately after** (`_route_after_gift_picker`
+      in `src/orchestrator.py`) — not by watching for a key in a yielded
+      event. An `EphemeralValue` signal (the mechanism Phase 1 uses for
+      `structured_response`) was tried first and doesn't work here: it only
+      survives exactly one step past the write, but the Gift-Picker's own
+      ReAct loop always needs one more internal step after any tool call
+      (the model's reply acknowledging the tool result) before the subgraph
+      itself returns to the parent — so an ephemeral flag set inside that
+      subgraph is already cleared by the time control returns here. The
+      plain before/after value comparison has no such timing gap and is
+      still robust to a stale cart (a value diff, not a presence check).
+      Cart changed → `_cart_proposed_stub` (Phase 3 doesn't exist yet,
+      matching the Phase 1 stub precedent) logs a note; the Gift-Picker's
+      own narration (already in shared `messages`) is left as the reply,
+      unlike Phase 1's stubs, which had no real agent output to relay.
+      No cart change → `_no_cart_relay` console-prints `product_suggestions`
+      as a stand-in for "cards" (no real UI yet).
+- [x] **Real bug found and fixed while wiring this up:** embedding the
+      Intent Router as a literal subgraph node (Phase 1's original design)
+      shares `messages` in both directions — its own classification-turn
+      `AIMessage` was getting appended to shared history. Harmless on its
+      own, but once the Gift-Picker (a second real model call in the same
+      turn) reads that history, Gemini rejects the request outright:
+      *"final request turn must be a user message or a function response"*
+      — no prefill support, and history now ended in an assistant turn with
+      nothing after it. Fixed by wrapping the router in `_run_intent_router`
+      (`src/orchestrator.py`), which calls it with `state["messages"]` as
+      input but returns only `{"structured_response": ...}` — the router's
+      internal turn should never have been part of the customer-facing
+      transcript regardless of this bug. Phase 1's own tests still pass
+      unchanged after this fix.
+- [x] `src/pipeline.py::run_turn` fixed to read `.text` off the final
+      message instead of `.content` — Gemini's `AIMessage.content` is a list
+      of content blocks (with a `signature` field etc.), not a plain string;
+      `.content` was leaking that raw structure into the reply text.
 - [x] Test: **explicit products** shape ("flower bouquet and chocolates for
       the anniversary") — verified live, two-turn conversation:
-      1. Searched real Kapruka products, called `suggest_products` with 4
-         well-matched items (2 flower bouquets, 2 chocolate boxes),
-         narrated text matched exactly what was suggested, correctly did
-         *not* call `propose_cart` yet — asked about budget/delivery
-         instead.
-      2. Customer picked 2 of the 4 and gave a delivery city →
-         `propose_cart` fired with the right 2 items, correct prices
-         (LKR 4,000 + 3,750), correct total (7,750), sensible `notes`.
-         Orchestrator correctly detected the state update and printed the
-         Phase 3 stub transition.
-- [ ] Test: **vague + implied bundle** shape ("surprise my mom for her
+      1. Searched real Kapruka products, called `suggest_products` with 5
+         well-matched items, narrated text matched what was suggested,
+         correctly did *not* call `propose_cart` yet — asked a follow-up
+         about preference/budget/delivery instead.
+      2. Customer picked 2 of the suggested items and gave a delivery city
+         + date → `propose_cart` fired with the right 2 items, correct
+         `product_id`s, correct prices (LKR 5,210 + 4,150), correct total
+         (9,360), captured `delivery_city`/`delivery_date` exactly as
+         stated (not guessed). `_route_after_gift_picker` correctly detected
+         the change and logged the Phase 3 stub transition;
+         `product_suggestions` correctly cleared to `[]`.
+- [x] Test: **vague + implied bundle** shape ("surprise my mom for her
       birthday, plan a gift pack under 15000 LKR") with a seeded
-      `recipients` row — harness ready at `scripts/test_gift_picker.py`
-      (seeds/cleans up a "Mum"/mother row), **not yet verified — blocked**.
-      Discovered mid-testing: `LLM_MODEL` (`gemini-3.8-flash`, set in
-      `src/config.py`) is capped at **20 free-tier requests/day**
-      (`generativelanguage.googleapis.com/generate_content_free_tier_requests`,
-      confirmed via the API's own 429 response). Earlier "503 UNAVAILABLE"
-      failures during this same testing session were likely this same
-      quota, not real outages. Burned through it validating the explicit-
-      products shape above; re-run once the quota resets or a
-      higher-quota/paid model is configured.
-- [ ] Test: **zero-result search** recovery — harness ready
-      (`scripts/test_gift_picker.py::zero_results_case`), **not yet run**,
-      same quota block.
-- [ ] Test that rendered suggestions and narrated text agree — confirmed
-      by inspection on the one live run above (4 suggested, 4 narrated);
-      not yet deliberately stress-tested for a mismatch.
-- [x] **Retroactive Phase 2 amendment** — added optional
-      `delivery_city: str | None` / `delivery_date: str | None` to
-      `propose_cart`'s schema (`src/gift_picker/tools.py`), captured into
-      graph state's `cart`. `GIFT_PICKER_INSTRUCTIONS` tells the model to
-      pass these along when the customer already said them, never to guess
-      or ask just to fill them in.
+      `recipients` row (relationship="mother", preferences="loves tea,
+      floral scents, and Ferrero chocolates", cleaned up after the test) —
+      verified live: `get_recipient_profile("mom")` correctly matched the
+      "mother" row, products searched were genuinely aligned with the
+      stored preferences (tea box, Ferrero Rocher, flowers, cake), stayed
+      within budget (13,940 of 15,000), and correctly held off on
+      `propose_cart` pending delivery city/date. No quota block this
+      time — Phase 0 already corrected the model name
+      (`gemini-2.5-flash` → `gemini-3.6-flash`); the 20-req/day free-tier
+      cap the v1 build hit doesn't apply to `gemini-3.6-flash`. Did hit
+      Kapruka MCP's own 60-req/min rate limit once from rapid manual
+      testing in this same session (429, not a bug) — waited it out.
+- [ ] Test: **zero-result search** recovery — not yet run. Deferred rather
+      than burning more of the shared, public Kapruka MCP endpoint's rate
+      limit on speculative edge cases; revisit if a real conversation hits
+      it.
+- [x] Test that rendered suggestions and narrated text agree — confirmed on
+      both live runs above (suggested counts and narrated items matched
+      exactly each time).
 
 ## Phase 3 — Deterministic pipeline
 Built as `src/checkout/` (`mcp_client.py`, `delivery.py`, `summary.py`,
