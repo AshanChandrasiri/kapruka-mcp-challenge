@@ -1,0 +1,192 @@
+<mxfile host="app.diagrams.net" modified="2026-09-12T00:00:00.000Z" agent="Claude" version="24.0.0" type="device">
+  <diagram name="Current Implementation Flow" id="kapruka-current-impl-flow">
+    <mxGraphModel dx="1600" dy="1000" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1980" pageHeight="1560" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="m1" value="Kapruka Gift Concierge — Current Implementation (Phase 1): Information Flow" style="text;html=1;fontSize=22;fontStyle=1;align=center;verticalAlign=middle;fontColor=#333333;" vertex="1" parent="1">
+          <mxGeometry x="300" y="-80" width="1200" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="m1b" value="Every box below is a real object/call in the code as it exists today — no gift-picker, no checkout, no FastAPI yet." style="text;html=1;fontSize=12;fontStyle=2;align=center;verticalAlign=middle;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="300" y="-40" width="1200" height="24" as="geometry" />
+        </mxCell>
+
+        <mxCell id="m2" value="User types a message in the console&lt;br&gt;(main.py interactive loop, or argv on launch)" style="ellipse;whiteSpace=wrap;html=1;fillColor=#F5F5F5;strokeColor=#666666;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="760" y="0" width="340" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="m3" value="main.py :: run_turn(phone_number, message)&lt;br&gt;builds Runner(agent=build_orchestrator())&lt;br&gt;calls runner.run_async(user_id, session_id,&lt;br&gt;new_message, run_config)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F5F5F5;strokeColor=#666666;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="720" y="110" width="420" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="m4" value="ADK Runner&lt;br&gt;1. get/create session via session_service&lt;br&gt;2. append inbound message as an Event (once)&lt;br&gt;3. invoke root agent: ConciergeOrchestrator" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="720" y="260" width="420" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="m5" value="DatabaseSessionService&lt;br&gt;(Neon Postgres)&lt;br&gt;ADK's own session / event tables" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#FFF2CC;strokeColor=#D6B656;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="1220" y="260" width="260" height="120" as="geometry" />
+        </mxCell>
+
+        <mxCell id="m6" value="ConciergeOrchestrator (custom BaseAgent) — root agent&lt;br&gt;_run_async_impl(ctx) runs inside Runner's single InvocationContext" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#333333;dashed=1;verticalAlign=top;align=left;spacingLeft=12;spacingTop=8;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="260" y="420" width="1300" height="730" as="geometry" />
+        </mxCell>
+
+        <mxCell id="m7" value="Step 1 — self.router_agent.run_async(ctx)&lt;br&gt;Intent Router = LlmAgent, zero tools (Gemini call)&lt;br&gt;output_schema=IntentClassification, output_key=&lt;br&gt;'intent_classification'. Same ctx -&gt; same session,&lt;br&gt;message NOT appended twice" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#B0E3E6;strokeColor=#0E8088;fontSize=12;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="300" y="480" width="620" height="140" as="geometry" />
+        </mxCell>
+        <mxCell id="m8" value="async for event in router_agent.run_async(ctx):&lt;br&gt;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;yield event&lt;br&gt;Forwards each router event upward to Runner/main.py&lt;br&gt;as it's produced. The loop only ends once the router&lt;br&gt;is fully done — that's the 'wait'." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1D5E7;strokeColor=#9673A6;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="960" y="480" width="540" height="140" as="geometry" />
+        </mxCell>
+        <mxCell id="m9" value="Router finished -&gt; ctx.session.state['intent_classification']&lt;br&gt;now holds IntentClassification(intent, reasoning)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF2CC;strokeColor=#D6B656;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="300" y="650" width="620" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="m10" value="classification.intent&lt;br&gt;== ?" style="rhombus;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=12;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="500" y="770" width="220" height="110" as="geometry" />
+        </mxCell>
+
+        <mxCell id="m11" value="chitchat&lt;br&gt;canned CHITCHAT_RESPONSE&lt;br&gt;no DB read, no LLM, no MCP tool" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F5F5F5;strokeColor=#666666;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="320" y="920" width="220" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="m12" value="out_of_scope&lt;br&gt;canned OUT_OF_SCOPE_RESPONSE" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F5F5F5;strokeColor=#666666;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="560" y="920" width="220" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="m13" value="gift_request&lt;br&gt;(stub) Gift-Picker agent&lt;br&gt;arrives Phase 2" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1D5E7;strokeColor=#9673A6;fontSize=11;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="800" y="920" width="220" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="m14" value="track_order&lt;br&gt;(stub) arrives Phase 4" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=11;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="1040" y="920" width="220" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="m15" value="return_item&lt;br&gt;(stub) Phase 5 — MCP has&lt;br&gt;no return/refund tool" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F5F5F5;strokeColor=#B85450;fontSize=11;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="1280" y="920" width="220" height="100" as="geometry" />
+        </mxCell>
+
+        <mxCell id="m16" value="yield Event(author='concierge_orchestrator',&lt;br&gt;content=reply text)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="540" y="1070" width="340" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="m17" value="Runner appends each yielded Event to the session&lt;br&gt;(persisted via DatabaseSessionService) and streams&lt;br&gt;it back to the caller (main.py)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="640" y="1190" width="500" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="m18" value="main.py :: run_turn&lt;br&gt;filters events where event.author == 'concierge_orchestrator'&lt;br&gt;prints part.text as 'Concierge: ...'" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F5F5F5;strokeColor=#666666;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="640" y="1310" width="500" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="m19" value="Console shows the reply to the user" style="ellipse;whiteSpace=wrap;html=1;fillColor=#F5F5F5;strokeColor=#666666;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="700" y="1430" width="380" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="m20" value="Session identity convention:&lt;br&gt;phone_number == user_id == session_id&lt;br&gt;(src/session.py::session_identity)&lt;br&gt;Router + Orchestrator (and later&lt;br&gt;Gift-Picker) all read/write ONE&lt;br&gt;shared Postgres-backed session" style="shape=note;whiteSpace=wrap;html=1;fillColor=#FFF2CC;strokeColor=#D6B656;size=20;fontSize=11;align=center;" vertex="1" parent="1">
+          <mxGeometry x="1620" y="260" width="300" height="140" as="geometry" />
+        </mxCell>
+        <mxCell id="m21" value="Known simplification:&lt;br&gt;GetSessionConfig(num_recent_events=4)&lt;br&gt;is set on the top-level Runner call,&lt;br&gt;so it bounds history for the WHOLE&lt;br&gt;orchestrator turn — not just the&lt;br&gt;router's slice. Harmless today&lt;br&gt;(other branches are canned/stub,&lt;br&gt;no LLM calls of their own)." style="shape=note;whiteSpace=wrap;html=1;fillColor=#F8CECC;strokeColor=#B85450;size=20;fontSize=11;align=center;" vertex="1" parent="1">
+          <mxGeometry x="1620" y="420" width="300" height="190" as="geometry" />
+        </mxCell>
+        <mxCell id="m22" value="Not yet built:&lt;br&gt;FastAPI webhook entry point.&lt;br&gt;main.py's console loop (argv or&lt;br&gt;interactive input()) IS the current&lt;br&gt;way a message enters the system." style="shape=note;whiteSpace=wrap;html=1;fillColor=#F5F5F5;strokeColor=#B85450;size=20;fontSize=11;align=center;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="1620" y="630" width="300" height="150" as="geometry" />
+        </mxCell>
+
+        <mxCell id="m23" value="Legend" style="text;html=1;fontSize=14;fontStyle=1;align=left;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="1620" y="810" width="200" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="m24" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#F5F5F5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="1620" y="850" width="24" height="20" as="geometry" />
+        </mxCell>
+        <mxCell id="m25" value="Plain Python / entry point" style="text;html=1;fontSize=12;align=left;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="1654" y="846" width="290" height="24" as="geometry" />
+        </mxCell>
+        <mxCell id="m26" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;" vertex="1" parent="1">
+          <mxGeometry x="1620" y="882" width="24" height="20" as="geometry" />
+        </mxCell>
+        <mxCell id="m27" value="Deterministic dispatch / state" style="text;html=1;fontSize=12;align=left;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="1654" y="878" width="290" height="24" as="geometry" />
+        </mxCell>
+        <mxCell id="m28" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#B0E3E6;strokeColor=#0E8088;" vertex="1" parent="1">
+          <mxGeometry x="1620" y="914" width="24" height="20" as="geometry" />
+        </mxCell>
+        <mxCell id="m29" value="Router — single LLM call (no tools)" style="text;html=1;fontSize=12;align=left;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="1654" y="910" width="290" height="24" as="geometry" />
+        </mxCell>
+        <mxCell id="m30" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#E1D5E7;strokeColor=#9673A6;" vertex="1" parent="1">
+          <mxGeometry x="1620" y="946" width="24" height="20" as="geometry" />
+        </mxCell>
+        <mxCell id="m31" value="Agent machinery — event yield/forward" style="text;html=1;fontSize=12;align=left;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="1654" y="942" width="290" height="24" as="geometry" />
+        </mxCell>
+        <mxCell id="m32" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFF2CC;strokeColor=#D6B656;" vertex="1" parent="1">
+          <mxGeometry x="1620" y="978" width="24" height="20" as="geometry" />
+        </mxCell>
+        <mxCell id="m33" value="Persistent store / session state" style="text;html=1;fontSize=12;align=left;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="1654" y="974" width="290" height="24" as="geometry" />
+        </mxCell>
+        <mxCell id="m34" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#F5F5F5;strokeColor=#B85450;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="1620" y="1010" width="24" height="20" as="geometry" />
+        </mxCell>
+        <mxCell id="m35" value="Stub / not built yet" style="text;html=1;fontSize=12;align=left;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="1654" y="1006" width="290" height="24" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;strokeColor=#666666;" edge="1" parent="1" source="m2" target="m3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;strokeColor=#666666;" edge="1" parent="1" source="m3" target="m4">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e3" value="get/create session; append message" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=10;strokeColor=#D6B656;dashed=1;" edge="1" parent="1" source="m4" target="m5">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e4" value="invoke as root agent (same ctx)" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;strokeColor=#6C8EBF;" edge="1" parent="1" source="m4" target="m7">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e5" value="each event produced" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;strokeColor=#9673A6;" edge="1" parent="1" source="m7" target="m8">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e6" value="generator exhausted" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;strokeColor=#9673A6;" edge="1" parent="1" source="m8" target="m9">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e7" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;strokeColor=#666666;" edge="1" parent="1" source="m9" target="m10">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e8" value="chitchat" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;strokeColor=#666666;" edge="1" parent="1" source="m10" target="m11">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e9" value="out_of_scope" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;strokeColor=#666666;" edge="1" parent="1" source="m10" target="m12">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e10" value="gift_request" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;strokeColor=#9673A6;" edge="1" parent="1" source="m10" target="m13">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e11" value="track_order" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;strokeColor=#6C8EBF;" edge="1" parent="1" source="m10" target="m14">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e12" value="return_item" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;strokeColor=#B85450;" edge="1" parent="1" source="m10" target="m15">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e13" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=10;strokeColor=#999999;" edge="1" parent="1" source="m11" target="m16">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e14" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=10;strokeColor=#999999;" edge="1" parent="1" source="m12" target="m16">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e15" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=10;strokeColor=#999999;" edge="1" parent="1" source="m13" target="m16">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e16" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=10;strokeColor=#999999;" edge="1" parent="1" source="m14" target="m16">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e17" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=10;strokeColor=#999999;" edge="1" parent="1" source="m15" target="m16">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e18" value="exits _run_async_impl" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;strokeColor=#6C8EBF;" edge="1" parent="1" source="m16" target="m17">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e19" value="events persisted" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=10;strokeColor=#D6B656;dashed=1;" edge="1" parent="1" source="m17" target="m5">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e20" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;strokeColor=#666666;" edge="1" parent="1" source="m17" target="m18">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e21" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;strokeColor=#666666;" edge="1" parent="1" source="m18" target="m19">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
