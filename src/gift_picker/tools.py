@@ -11,7 +11,7 @@ from langchain_core.tools import InjectedToolCallId, tool
 from langgraph.types import Command
 
 from src.db.recipients import find_recipients
-from src.gift_picker.state import Cart
+from src.gift_picker.state import Cart, ProductSuggestion
 
 
 @tool
@@ -38,7 +38,7 @@ async def get_recipient_profile(recipient_name: str, config: RunnableConfig) -> 
 
 @tool
 def suggest_products(
-    products: list[dict],
+    products: list[ProductSuggestion],
     tool_call_id: Annotated[str, InjectedToolCallId],
 ) -> Command:
     """Show the customer a set of candidate products to react to, before you've
@@ -48,10 +48,16 @@ def suggest_products(
     the customer sees these as cards alongside your text, so your narration
     should match what's actually listed here.
 
-    Each product dict must use the key `product_id` (NOT `id` — Kapruka's
-    search_products/get_product tools return the field as `id`; rename it
-    when you build this list). Include whatever else is useful to the
-    customer: name, price, currency, image_url.
+    Each product needs:
+    - `product_id`: Kapruka's search_products/get_product tools return this
+      field as `id` — rename it, and copy the value EXACTLY as returned
+      (same case, same characters, do not retype it).
+    - `name`
+    - `price`: a plain number — if the source has `price.amount`/
+      `price.currency`, flatten it to just the amount.
+    - `image_url`
+    - `url`: the product's page link on Kapruka, as returned by
+      kapruka_get_product.
 
     Each call REPLACES the previous suggestions, it doesn't add to them —
     call it again with the full new set whenever you refine the options.
@@ -87,7 +93,9 @@ def propose_cart(
     turn: don't call it and then keep negotiating in the same reply.
 
     Each item dict must use the key `product_id` (NOT `id` — see
-    suggest_products for why), plus whatever price/name info you have.
+    suggest_products for the exact-case, no-retyping rule), plus a plain
+    `price` number (never a nested price object) and whatever name info you
+    have.
 
     Pass delivery_city/delivery_date only if the customer has already
     stated them in this conversation — never guess, and never ask for them

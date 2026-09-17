@@ -1,8 +1,8 @@
 # Build Plan — Kapruka Gift Concierge (v1)
 
-**Status: v2 rebuild in progress — Phases 0-2 complete (this directory
+**Status: v2 rebuild in progress — Phases 0-3 complete (this directory
 started empty: no repo, no venv, no source — only
-`.env`/`CLAUDE.md`/`PLAN.md`/`docs/` carried over). Everything from Phase 3
+`.env`/`CLAUDE.md`/`PLAN.md`/`docs/` carried over). Everything from Phase 4
 onward in this file is still the narrative from the earlier build, kept as
 design-decision history — that code does not exist yet in `v2` and needs to
 be rebuilt phase by phase.**
@@ -279,98 +279,150 @@ pool needed the same IPv4-forcing fix from Phase 0).
       both live runs above (suggested counts and narrated items matched
       exactly each time).
 
-## Phase 3 — Deterministic pipeline
-Built as `src/checkout/` (`mcp_client.py`, `delivery.py`, `summary.py`,
-`order.py`, `flow.py`) + a stage pre-check in `src/orchestrator.py`.
-**Verified live**, up to and stopping just short of an actual `yes`
-(placing a real order is a genuine financial action — didn't trigger one
-during dev testing):
-- [x] **New graph state's `stage` field**
-      (`src/checkout/flow.py::STAGE_KEY`), checked by the orchestrator
-      *before* the Intent Router runs: `collecting_delivery` |
-      `resolving_delivery_conflict` | `awaiting_confirm` | absent (normal
-      flow). Confirmed live both ways: a bare "yes" sent with no active
-      checkout correctly fell through to normal classification (not
-      checkout); once a checkout was in progress, replies were correctly
-      *not* reclassified.
-- [x] `collecting_delivery` — deterministic, one field per turn, no LLM
-      call at all (verified: these turns produced no LLM request).
-      **Scope discovered beyond the original plan text:** the live
-      `kapruka_create_order` schema (checked against the real tool schema,
-      not guessed) requires `recipient{name,phone}`, `delivery{address,
-      city,date}`, `sender{name}` — not just city/date. `propose_cart` only
-      captures city/date (see the Phase 2 amendment above), so
-      `collecting_delivery` was extended to also collect recipient name,
-      recipient phone, delivery address, and sender name, one at a time,
-      via the same plain-text-ask pattern — checkout cannot succeed against
-      the real API without them. **Known rough edge, confirmed live:** the
-      Gift-Picker often already narrates these details itself when the
-      customer states them up front (it's a capable model), so
-      `collecting_delivery` asking again for values already stated reads as
-      slightly repetitive. Not fixed here — `propose_cart`'s schema would
-      need to grow further, deferred rather than expanded mid-flow.
+## Phase 3 — Deterministic pipeline (rebuilt and tested for v2, 2026-09-16)
+Rebuilt from scratch: `src/checkout/{mcp_client,delivery,summary,order,flow}.py`
++ a stage pre-check wired into `src/orchestrator.py`. **Confirmed the exact
+live tool schemas up front** (`kapruka_create_order`/`kapruka_check_delivery`/
+`kapruka_track_order`) rather than trusting `docs/mcp/kapruka-mcp-tools.md`'s
+summary — resolves the v1 build's own flagged ambiguity: `order_ref`,
+`checkout_url`, `summary.grand_total` are confirmed real field names, not
+inferred. **Verified live up through a fresh `awaiting_confirm` summary,
+twice** — never sent an actual `yes` (a real financial action), matching the
+v1 build's own deliberate boundary exactly.
+
+- [x] **Raw MCP client, confirmed not assumed**
+      (`src/checkout/mcp_client.py::call_kapruka_tool`) — connected directly
+      with the low-level `mcp` package (`streamable_http_client` +
+      `ClientSession`, not `MultiServerMCPClient`) and inspected a real
+      `kapruka_check_delivery` response with `response_format: "json"`:
+      `structuredContent` comes back as `{"result": "<json string>"}` — a
+      JSON string nested inside the dict, confirmed byte-for-byte, not
+      guessed.
+- [x] **`stage` field on `ConciergeState`**
+      (`collecting_delivery` | `resolving_delivery_conflict` |
+      `awaiting_confirm` | absent), checked by `_route_from_start`
+      (`src/orchestrator.py`) via a conditional edge from `START` itself —
+      *before* the Intent Router ever runs. Verified live: a stage in
+      progress correctly bypassed classification on every subsequent
+      customer reply.
+- [x] **`resolving_delivery_conflict` reuses the exact same
+      `reset_before_gift_picker -> gift_picker -> _route_after_gift_picker`
+      chain Phase 2 built for a fresh `gift_request`** — the only
+      difference is which stage routes into it, and that the cart-changed
+      branch now goes to the real `start_checkout_node` instead of Phase 2's
+      stub. Verified live: a customer reply while `resolving_delivery_conflict`
+      correctly skipped the router, reached the Gift-Picker directly, and a
+      subsequent `propose_cart` call correctly flowed back into the checkout
+      pipeline.
+- [x] **Gate ordering discovered while implementing, not called out
+      explicitly in the original plan text:** `kapruka_check_delivery`
+      needs a city + date, but `propose_cart`'s are optional — so
+      `_advance_checkout` (`src/checkout/flow.py`) has to ask for
+      `delivery_city`/`delivery_date` FIRST (Gate 1) before the delivery
+      check can run at all (Gate 2), before collecting the rest of
+      `kapruka_create_order`'s required fields — `recipient{name,phone}`,
+      `delivery.address`, `sender.name` (Gate 3, confirmed against the real
+      schema, not guessed) — one field per turn, no LLM call. **Known rough
+      edge, same as the v1 build's own note:** the Gift-Picker sometimes
+      already narrates these details when the customer states them
+      up front, so re-asking can read as repetitive; not fixed here.
 - [x] **Check delivery per distinct product, not once per cart**
-      (`src/checkout/delivery.py::check_delivery_for_cart`) — one
-      `kapruka_check_delivery` call per distinct `product_id`. Verified
-      live against the real MCP server (real delivery fee returned:
-      LKR 300 for Colombo 03).
-- [x] **On a failed check, hand back to the Gift-Picker agent.** A
-      `[System note — not from the customer: ...]` event carrying the
-      failure reason(s) is injected into the shared session before
-      re-invoking the *same* Gift-Picker sub-agent
-      (`src/checkout/flow.py::run_delivery_check` /
-      `_run_gift_picker_for_revision`) — reused verbatim for the
-      confirm-step "reply wasn't a yes" case too, per the plan's own
-      framing that these are the same move. **Verified live** via the
-      confirm-step path: a non-yes reply at `awaiting_confirm` correctly
-      handed back to the Gift-Picker, which called `propose_cart` again
-      (detected via `the node's returned state update`), which correctly re-ran
-      the delivery check and re-landed on `awaiting_confirm` with a fresh
-      summary. (The *actual failed-check* trigger for this same code path
-      — e.g. a real undeliverable city — wasn't separately exercised live;
-      it shares 100% of the code with the path that was.)
+      (`src/checkout/delivery.py::check_delivery_for_cart`). Verified live
+      twice (Colombo 03, LKR 300 both times, including after a cart swap).
+- [x] **On a failed check, hand back to the Gift-Picker** — a
+      `[System note — not from the customer: ...]` `HumanMessage` (needs to
+      be a real user-role turn, not a `SystemMessage`, or Gemini has nothing
+      to react to) is injected before re-invoking a fresh Gift-Picker
+      instance (`_invoke_gift_picker_for_revision`), reused for both a
+      failed check and a non-`yes` confirm-step reply. Bounded to
+      `MAX_REVISION_ATTEMPTS = 2` retries before giving up and asking the
+      customer directly — **not** in the v1 plan text, added because
+      nothing else bounds a Gift-Picker-revise-check-fail loop within one
+      graph invocation. **Verified live via the confirm-step path**: "wait,
+      can you swap the chocolate box for a birthday cake instead?" correctly
+      handed back to the Gift-Picker (which offered cake options without
+      re-proposing yet → `stage` correctly stayed `resolving_delivery_conflict`),
+      then picking one correctly triggered `propose_cart` → re-entered
+      `start_checkout_node` → re-ran the delivery check on the *new* cart →
+      landed on a fresh `awaiting_confirm` summary. (The actual
+      failed-*delivery*-check trigger — e.g. a real undeliverable city —
+      wasn't separately exercised live, same deliberate scope choice the v1
+      build made: it shares 100% of the code with the path that was tested.)
+- [x] **Real bug found and fixed: `delivery_checked` needs to invalidate
+      itself, not rely on every call site remembering to reset it.** First
+      implementation cleared a `delivery_checked` boolean by hand in
+      `handle_awaiting_confirm`'s revision branch, but missed the
+      `resolving_delivery_conflict` re-entry path entirely — a cart swapped
+      via that route would have skipped Gate 2 for the *new* cart, trusting
+      a delivery check that was actually run against the *old* one. Fixed
+      by keying the flag to the cart it was actually checked against
+      (`checkout_info["delivery_checked_cart"] == cart`) so it self-corrects
+      regardless of entry path, and removed the now-redundant manual reset.
+      Live-verified via the cake-swap test above — the delivery check
+      genuinely re-ran (new perishable warning appeared) rather than being
+      skipped.
+- [x] **Two real Gift-Picker robustness bugs found live, fixed in
+      `src/gift_picker/tools.py`'s docstrings:** (1) `suggest_products`
+      sometimes emitted a nested `price: {amount, currency}` object instead
+      of the flat number the docstring asked for — tightened the wording,
+      and made `build_summary` (`src/checkout/summary.py::_item_price`)
+      defensively handle both shapes regardless, since a docstring is
+      guidance, not a guarantee. (2) `propose_cart` once re-cased a
+      `product_id` (`CHOCOLATES001937` → `chocolates001937`) instead of
+      copying it verbatim — tightened both tool docstrings to say so
+      explicitly. **Known residual risk:** this is a prompt-level fix, not a
+      code-enforced one; a live `kapruka_create_order` call with a
+      still-miscased `product_id` was never actually exercised (per the hard
+      rule below), so whether Kapruka's real API is case-sensitive there
+      remains unconfirmed.
 - [x] Perishable warning surfaced (not blocking) in the summary when
-      present — `src/checkout/summary.py`.
+      present. **Found and fixed a doubled prefix:** Kapruka's own
+      `perishable_warning` text already reads like "Note: ...", and
+      `build_summary` was prepending its own "Note: " on top — fixed to
+      pass the warning through as-is.
 - [x] **Show Summary** (`src/checkout/summary.py::build_summary`) — items,
-      prices, delivery fee (max across items, since Kapruka's own docs call
-      it a "flat" rate — see the comment on why `max` rather than assuming
-      they're always identical), total, perishable notes, delivery/
-      recipient/sender details. Verified live, exact output in the commit.
+      prices, delivery fee (max across items — Kapruka's own docs call it
+      "flat", `max` is a cheap defensive hedge against per-call
+      inconsistency), total, perishable notes, delivery/recipient/sender
+      details. Verified live twice, exact output shown above.
 - [x] **Human Confirm** — deterministic keyword check
       (`src/checkout/flow.py::_is_confirmation`), not a classifier call.
-      **Design note on `interrupt()`:** LangGraph's interrupt
-      pause/resume was deliberately not used — it's implemented inside
-      LangGraph's graph execution and interrupt mechanism and LangGraph checkpointing and interrupt/resume mechanism
-      (confirmed by reading `flows/llm_flows/request_confirmation.py`),
-      neither of which fits a deterministic, no-agent checkout call without
-      either reintroducing agent judgment or standing up resumability just
-      for this. "Unreachable without an explicit human confirm" is instead
-      enforced structurally: `kapruka_create_order` has exactly one call
-      site in the whole codebase (`src/checkout/order.py::create_order`,
-      called only from `handle_awaiting_confirm` after the keyword check
-      passes) — verifiable by inspection. Live-verified the gate itself
-      (bare "yes" with no checkout in progress does nothing; a non-yes
-      reply during confirm does not check out); the actual create_order
-      call was deliberately never triggered during testing.
-- [x] `Checkout` calls `kapruka_create_order` via a raw deterministic MCP
-      client call (`src/checkout/mcp_client.py`), not `MultiServerMCPClient` — see
-      the `interrupt()` note above for why. **Untested against a
-      live success response** (real financial action) — response field
-      names (`order_ref`, a pay-link key) are inferred from the tool's own
-      schema/docs, not confirmed; flagged clearly in `order.py`'s docstring
-      to verify the first time this actually runs.
+      **Design note on `interrupt()`:** deliberately not used — LangGraph's
+      interrupt/resume machinery is built for pausing *inside* an agent's
+      own tool-calling turn; using it here would mean either routing
+      `kapruka_create_order` through an LLM's tool call (reintroducing agent
+      judgment into checkout, which this phase exists to avoid) or standing
+      up resumability just for one call. "Unreachable without an explicit
+      human confirm" is instead enforced structurally: `kapruka_create_order`
+      has exactly one call site in the whole codebase
+      (`src/checkout/order.py::create_order`, called only from
+      `handle_awaiting_confirm` after `_is_confirmation` passes) — verifiable
+      by inspection.
+- [x] `Checkout` calls `kapruka_create_order` via the raw MCP client — see
+      the schema-confirmation note at the top of this phase for why the
+      response field names are now *confirmed*, not inferred like the v1
+      build left them.
 - [x] On success: writes `phone_number`, `items` (JSONB), `product_summary`,
-      `total_amount`, `delivery_city`, `delivery_date`, `kapruka_order_id`,
-      `status` to `orders` (`src/checkout/order.py::save_order`) —
-      required adding those four columns via `ALTER TABLE ... ADD COLUMN
-      IF NOT EXISTS` in `src/db/schema.sql` (applied to the live Neon
-      instance). Clears `cart`/`checkout_info`/`stage`/`collecting_field`
-      structurally, same pattern as `product_suggestions`.
+      `total_amount` (the real `summary.grand_total` from the order
+      response, not the cart's own pre-delivery-fee `estimated_total`),
+      `delivery_city`, `delivery_date`, `kapruka_order_id` (`order_ref`),
+      `status` ("pending_payment") to `orders`
+      (`src/checkout/order.py::save_order`, its own connection pool — same
+      IPv4-forcing pattern as `src/db/recipients.py`). Clears
+      `cart`/`checkout_info`/`stage`/`collecting_field`/`product_suggestions`
+      structurally on success.
 - [x] `Track Order` here (`src/checkout/order.py::track_order_once`) is a
-      best-effort immediate status check right after checkout, distinct
-      from Phase 4's `track_order` *intent*. An "order not found yet" result
-      here is treated as expected (payment likely isn't complete yet), not
-      an error.
+      best-effort immediate status check right after checkout — catches any
+      exception and returns `None`, since "order not found yet" is expected
+      (payment likely isn't complete) rather than an error. **Untested
+      against a live response**, along with `create_order`/`save_order`'s
+      success path — a real order is a genuine financial action, and per
+      the hard rule below no "yes" was ever sent during this dev session,
+      same deliberate boundary as the v1 build.
+
+**Hard rule, unchanged: `kapruka_create_order` is only ever called after an
+explicit human confirm. Never let the agent call checkout directly, and
+never skip the confirmation step "to save a round trip."**
 
 ## Phase 4 — Track-order branch
 - [ ] Order-number extraction (ask if missing) → `kapruka_track_order` →

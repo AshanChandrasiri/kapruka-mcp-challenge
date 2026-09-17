@@ -10,6 +10,15 @@ node, the same mechanism Phase 1 relies on for `messages`.
 from typing import NotRequired, Optional, TypedDict
 
 from langchain.agents.middleware.types import AgentState
+from pydantic import BaseModel
+
+
+class ProductSuggestion(BaseModel):
+    product_id: str
+    name: str
+    price: float
+    image_url: str
+    url: str
 
 
 class Cart(TypedDict):
@@ -21,5 +30,5 @@ class Cart(TypedDict):
 
 
 class GiftPickerState(AgentState):
-    product_suggestions: NotRequired[list[dict]]
+    product_suggestions: NotRequired[list[ProductSuggestion]]
     cart: NotRequired[Optional[Cart]]

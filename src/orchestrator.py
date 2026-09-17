@@ -49,20 +49,35 @@ so an ephemeral flag set inside that subgraph would already be cleared by
 the time control returns to this parent graph. A plain before/after value
 comparison across the two real parent-level steps (reset -> Gift-Picker)
 has no such timing gap.
+
+Phase 3 (checkout) adds a stage pre-check ahead of everything above:
+`_route_from_start` reads `stage` before the Intent Router ever runs. A
+`collecting_delivery`/`awaiting_confirm`/`resolving_delivery_conflict` stage
+means a checkout is already in progress, and the customer's reply belongs
+to that flow, not a fresh classification — see src/checkout/flow.py for the
+state machine itself. `resolving_delivery_conflict` re-enters through the
+same `reset_before_gift_picker -> gift_picker -> _route_after_gift_picker`
+chain as a fresh `gift_request` — deliberately reused, since "the Gift-Picker
+needs another turn" is the same move either way. The only difference is
+where the cart-changed branch goes now: `start_checkout_node`
+(src/checkout/flow.py) replaces what was a Phase 2 stub.
 """
 
-from typing import Annotated, Optional, TypedDict
+from typing import Annotated, Literal, Optional, TypedDict
 
 from langchain_core.messages import AIMessage, AnyMessage
 from langgraph.channels.ephemeral_value import EphemeralValue
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
+from src.checkout.flow import handle_awaiting_confirm, handle_collecting_delivery, start_checkout_node
 from src.gift_picker.agent import build_gift_picker_agent
-from src.gift_picker.state import Cart
+from src.gift_picker.state import Cart, ProductSuggestion
 from src.prompts import CHITCHAT_RESPONSE, OUT_OF_SCOPE_RESPONSE
 from src.router.intent_router import Intent, IntentClassification, build_router_agent
 from src.session import get_checkpointer
+
+Stage = Literal["collecting_delivery", "resolving_delivery_conflict", "awaiting_confirm"]
 
 
 class ConciergeState(TypedDict, total=False):
@@ -72,13 +87,29 @@ class ConciergeState(TypedDict, total=False):
     # entirely, avoiding a custom-pydantic-type msgpack persistence warning.
     structured_response: Annotated[Optional[IntentClassification], EphemeralValue]
     intent: Optional[Intent]
-    product_suggestions: Optional[list[dict]]
+    product_suggestions: Optional[list[ProductSuggestion]]
     cart: Optional[Cart]
     # Orchestrator-only bookkeeping (the Gift-Picker never reads/writes this):
     # cart's value immediately before this turn's Gift-Picker run, so
     # _route_after_gift_picker can tell a fresh propose_cart call apart from
     # a cart left over from an earlier turn.
     cart_snapshot: Optional[Cart]
+    # Checkout state machine (src/checkout/flow.py) — absent means no
+    # checkout in progress.
+    stage: Optional[Stage]
+    checkout_info: Optional[dict]
+    collecting_field: Optional[str]
+
+
+def  _route_from_start(state: ConciergeState) -> str:
+    stage = state.get("stage")
+    if stage == "collecting_delivery":
+        return "handle_collecting_delivery"
+    if stage == "awaiting_confirm":
+        return "handle_awaiting_confirm"
+    if stage == "resolving_delivery_conflict":
+        return "reset_before_gift_picker"
+    return "intent_router"
 
 
 async def _run_intent_router(state: ConciergeState) -> dict:
@@ -120,13 +151,8 @@ def _reset_before_gift_picker(state: ConciergeState) -> dict:
 
 def _route_after_gift_picker(state: ConciergeState) -> str:
     if state.get("cart") != state.get("cart_snapshot"):
-        return "cart_proposed_stub"
+        return "start_checkout"
     return "no_cart_relay"
-
-
-def _cart_proposed_stub(state: ConciergeState) -> dict:
-    print("[stub] cart proposed this turn — checkout pipeline lands in Phase 3")
-    return {}
 
 
 def _no_cart_relay(state: ConciergeState) -> dict:
@@ -168,19 +194,23 @@ async def build_orchestrator():
     graph.add_node("out_of_scope_node", _out_of_scope_node)
     graph.add_node("reset_before_gift_picker", _reset_before_gift_picker)
     graph.add_node("gift_picker", await build_gift_picker_agent())
-    graph.add_node("cart_proposed_stub", _cart_proposed_stub)
+    graph.add_node("start_checkout", start_checkout_node)
+    graph.add_node("handle_collecting_delivery", handle_collecting_delivery)
+    graph.add_node("handle_awaiting_confirm", handle_awaiting_confirm)
     graph.add_node("no_cart_relay", _no_cart_relay)
     graph.add_node("track_order_stub", _track_order_stub)
     graph.add_node("return_item_stub", _return_item_stub)
 
-    graph.add_edge(START, "intent_router")
+    graph.add_conditional_edges(START, _route_from_start)
     graph.add_edge("intent_router", "extract_intent")
     graph.add_conditional_edges("extract_intent", _route_on_intent)
     graph.add_edge("chitchat_node", END)
     graph.add_edge("out_of_scope_node", END)
     graph.add_edge("reset_before_gift_picker", "gift_picker")
     graph.add_conditional_edges("gift_picker", _route_after_gift_picker)
-    graph.add_edge("cart_proposed_stub", END)
+    graph.add_edge("start_checkout", END)
+    graph.add_edge("handle_collecting_delivery", END)
+    graph.add_edge("handle_awaiting_confirm", END)
     graph.add_edge("no_cart_relay", END)
     graph.add_edge("track_order_stub", END)
     graph.add_edge("return_item_stub", END)
