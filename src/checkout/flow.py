@@ -19,10 +19,12 @@ handle_awaiting_confirm, after _is_confirmation passes. Never call it
 anywhere else, and never skip that check "to save a round trip."
 """
 
+from datetime import datetime
+
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
 
-from src.checkout.delivery import check_delivery_for_cart
+from src.checkout.delivery import check_delivery_for_cart, resolve_city
 from src.checkout.order import create_order, save_order, track_order_once
 from src.checkout.summary import build_summary
 from src.gift_picker.agent import build_gift_picker_agent
@@ -30,9 +32,14 @@ from src.gift_picker.state import Cart
 
 MAX_REVISION_ATTEMPTS = 2
 
+DATE_FORMAT_HINT = "Please use the format YYYY-MM-DD (e.g. 2026-09-25)."
+
 FIELD_PROMPTS = {
     "delivery_city": lambda info: "Which city should I deliver this to?",
-    "delivery_date": lambda info: "What date would you like this delivered?",
+    "delivery_city_confirm": lambda info: (
+        f"Just to confirm — did you mean **{info['_pending_city']}**? (yes/no)"
+    ),
+    "delivery_date": lambda info: f"What date would you like this delivered? {DATE_FORMAT_HINT}",
     "recipient_name": lambda info: "Who's this for — what name should I put on the delivery?",
     "recipient_phone": lambda info: (
         f"What's a good phone number for {info.get('recipient_name', 'the recipient')}, "
@@ -53,6 +60,19 @@ _CONFIRM_KEYWORDS = {
 def _is_confirmation(text: str) -> bool:
     normalized = text.strip().lower().rstrip(".!")
     return normalized in _CONFIRM_KEYWORDS or normalized.startswith("yes")
+
+
+def _invalid_date_reason(text: str) -> str | None:
+    """Format/calendar-validity check only — deliberately not a
+    deliverability check (that's kapruka_check_delivery's job, run later in
+    Gate 2). Returns an error message to show the customer, or None if the
+    date is well-formed.
+    """
+    try:
+        datetime.strptime(text, "%Y-%m-%d")
+    except ValueError:
+        return f"'{text}' isn't a valid date. {DATE_FORMAT_HINT}"
+    return None
 
 
 async def _invoke_gift_picker_for_revision(messages: list, cart: Cart, note_text: str) -> dict:
@@ -187,11 +207,61 @@ async def start_checkout_node(state: dict) -> dict:
 
 
 async def handle_collecting_delivery(state: dict) -> dict:
+    """One field per turn, no LLM call — except `delivery_city`/
+    `delivery_date` get a deterministic validation pass against the
+    customer's raw answer BEFORE it's accepted into checkout_info, since
+    those two feed straight into kapruka_check_delivery (Gate 2) and a
+    typo there would otherwise surface as a confusing delivery-check
+    failure instead of a simple "that's not a real city/date" reply.
+    """
     field = state["collecting_field"]
     answer = state["messages"][-1].text.strip()
+    cart = state["cart"]
     checkout_info = dict(state.get("checkout_info") or {})
+
+    if field == "delivery_city_confirm":
+        pending_city = checkout_info.pop("_pending_city", None)
+        if _is_confirmation(answer):
+            checkout_info["delivery_city"] = pending_city
+            return await _advance_checkout(cart, checkout_info, state["messages"])
+        return _ask(
+            cart, checkout_info, "delivery_city",
+            [AIMessage(content="No problem — which city should I deliver this to?")],
+        )
+
+    if field == "delivery_city":
+        resolution = await resolve_city(answer)
+
+        if resolution.status == "exact":
+            checkout_info["delivery_city"] = resolution.canonical
+            return await _advance_checkout(cart, checkout_info, state["messages"])
+
+        if resolution.status == "alias":
+            checkout_info["_pending_city"] = resolution.canonical
+            return _ask(cart, checkout_info, "delivery_city_confirm", [])
+
+        if resolution.status == "suggestions":
+            options = ", ".join(resolution.candidates)
+            return _ask(
+                cart, checkout_info, "delivery_city",
+                [AIMessage(content=f"I couldn't find '{answer}' exactly. Did you mean one of: {options}?")],
+            )
+
+        # no_match
+        return _ask(
+            cart, checkout_info, "delivery_city",
+            [AIMessage(content=f"Sorry, '{answer}' doesn't look like a city we deliver to. Could you check the spelling and try again?")],
+        )
+
+    if field == "delivery_date":
+        error = _invalid_date_reason(answer)
+        if error:
+            return _ask(cart, checkout_info, "delivery_date", [AIMessage(content=error)])
+        checkout_info["delivery_date"] = answer
+        return await _advance_checkout(cart, checkout_info, state["messages"])
+
     checkout_info[field] = answer
-    return await _advance_checkout(state["cart"], checkout_info, state["messages"])
+    return await _advance_checkout(cart, checkout_info, state["messages"])
 
 
 async def handle_awaiting_confirm(state: dict, config: RunnableConfig) -> dict:
