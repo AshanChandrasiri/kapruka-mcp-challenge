@@ -47,6 +47,7 @@ async def resolve_city(query: str) -> CityResolution:
     result = await call_kapruka_tool(
         "kapruka_list_delivery_cities", {"query": query, "limit": 8}
     )
+
     cities = result.get("cities", [])
     query_norm = query.strip().lower()
 
@@ -54,19 +55,24 @@ async def resolve_city(query: str) -> CityResolution:
         if city["name"].strip().lower() == query_norm:
             return CityResolution(status="exact", canonical=city["name"])
 
-    for city in cities:
-        alias_tokens = {
-            token.lower()
-            for alias in city.get("aliases", [])
-            for token in alias.split()
-        }
-        if query_norm in alias_tokens:
-            return CityResolution(status="alias", canonical=city["name"])
+    if cities:
+        return CityResolution(status="suggestions", candidates=[c["name"] for c in cities])
 
-    if not cities:
-        return CityResolution(status="no_match")
+    return CityResolution(status="no_match")
+    # for city in cities:
+    #     suggestions = [city["name"].strip().lower() for city in cities]
+    #     alias_tokens = {
+    #         token.lower()
+    #         for alias in city.get("aliases", [])
+    #         for token in alias.split()
+    #     }
+    #     if query_norm in alias_tokens:
+    #         return CityResolution(status="alias", canonical=city["name"])
 
-    return CityResolution(status="suggestions", candidates=[c["name"] for c in cities])
+    # if not cities:
+    #     return CityResolution(status="no_match")
+    #
+    # return CityResolution(status="suggestions", candidates=[c["name"] for c in cities])
 
 
 @dataclass

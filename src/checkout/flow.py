@@ -147,7 +147,7 @@ def _ask(cart: Cart, checkout_info: dict, key: str, extra_messages: list) -> dic
         "checkout_info": checkout_info,
         "stage": "collecting_delivery",
         "collecting_field": key,
-        "messages": [*extra_messages, AIMessage(content=FIELD_PROMPTS[key](checkout_info))],
+        "messages": extra_messages if extra_messages else [AIMessage(content=FIELD_PROMPTS[key](checkout_info))],
     }
 
 
@@ -283,26 +283,43 @@ async def handle_collecting_delivery(state: dict) -> dict:
     if field == "delivery_city":
         resolution = await resolve_city(answer)
 
+        print('------------------')
+        print(resolution)
+        print('------------------')
+
+        ask = None
         if resolution.status == "exact":
+            print('########### 1 ###############')
             checkout_info["delivery_city"] = resolution.canonical
-            return await _advance_checkout(cart, checkout_info, state["messages"])
+            ask =  await _advance_checkout(cart, checkout_info, state["messages"])
+            return ask
 
         if resolution.status == "alias":
+            print('########### 2 ###############')
             checkout_info["_pending_city"] = resolution.canonical
-            return _ask(cart, checkout_info, "delivery_city_confirm", [])
+            ask =  _ask(cart, checkout_info, "delivery_city_confirm", [])
+            return ask
 
         if resolution.status == "suggestions":
+            print('########### 3 ###############')
             options = ", ".join(resolution.candidates)
-            return _ask(
+            ask =  _ask(
                 cart, checkout_info, "delivery_city",
                 [AIMessage(content=f"I couldn't find '{answer}' exactly. Did you mean one of: {options}?")],
             )
+            return ask
 
+        print('########### 4 ###############')
         # no_match
-        return _ask(
+        ask =  _ask(
             cart, checkout_info, "delivery_city",
             [AIMessage(content=f"Sorry, '{answer}' doesn't look like a city we deliver to. Could you check the spelling and try again?")],
         )
+
+        print('------------------------------')
+        print(ask)
+        print('------------------------------')
+        return ask
 
     if field == "delivery_date":
         error = _invalid_date_reason(answer)

@@ -78,13 +78,24 @@ verbatim; a real cancel request sent during `resolving_delivery_conflict`
 straight to the Gift-Picker, which "cancelled" by emptying the cart via
 `propose_cart` instead of a clean state clear — messier than the dedicated
 `cancel_checkout` path below. `_run_checkout_router` follows the same
-embedding pattern as `_run_intent_router` (fresh agent instance, only
-`messages[-1]` as input, only the classification fields returned) for the
-same reason: avoid polluting shared `messages` with the classifier's own
-turn. Unlike the Intent Router's `structured_response`, the Checkout
-Router's output fields (`checkout_intent`, `extracted_value`) are plain
-strings — no EphemeralValue/msgpack workaround needed, since there's no
-custom pydantic type being handed to the checkpointer.
+embedding pattern as `_run_intent_router` (fresh agent instance, full
+`messages` history as input, only the classification fields returned) for
+the same reason `_run_intent_router` does it: avoid polluting shared
+`messages` with the classifier's own turn. **Widened after initial
+implementation:** originally only `messages[-1]` was passed in (the
+explicit `stage`/`collecting_field`/`cart_summary` snapshot was meant to be
+sufficient on its own), but that throws away the same working-memory value
+full history gives the Gift-Picker — e.g. a customer's phrasing earlier in
+the conversation that disambiguates a short, otherwise-ambiguous reply.
+Safe to widen for the same reason it was safe for the Intent Router: this
+node never merges the classifier's own generated turn back into shared
+`messages` (only `checkout_intent`/`extracted_value` are returned), so
+`state["messages"]` going in still always ends on a real customer turn —
+the exact invariant that mattered when this bug was first found on the
+Intent Router (see above). Unlike the Intent Router's `structured_response`,
+the Checkout Router's output fields (`checkout_intent`, `extracted_value`)
+are plain strings — no EphemeralValue/msgpack workaround needed, since
+there's no custom pydantic type being handed to the checkpointer.
 
 `_route_on_checkout_intent` dispatches: `cancel_checkout` (any stage) to a
 new terminal node that clears checkout state; at `resolving_delivery_conflict`,
@@ -183,7 +194,11 @@ def _summarize_checkout_for_router(state: ConciergeState) -> str:
 async def _run_checkout_router(state: ConciergeState) -> dict:
     cart_summary = _summarize_checkout_for_router(state)
     router = build_checkout_router_agent(state["stage"], state.get("collecting_field"), cart_summary)
-    result = await router.ainvoke({"messages": state["messages"][-1:]})
+    # Full history, not just the latest message — same working-memory value
+    # it gives the Gift-Picker. Safe here for the same reason it's safe for
+    # _run_intent_router: this node never merges its own generated turn
+    # back into shared `messages`, only the classification fields below.
+    result = await router.ainvoke({"messages": state["messages"]})
     classification = result["structured_response"]
     return {"checkout_intent": classification.intent, "extracted_value": classification.extracted_value}
 

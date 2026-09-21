@@ -72,6 +72,12 @@ Current checkout state:
 - pending step (what we're actually waiting on): {collecting_field}
 - cart / checkout details collected so far: {cart_summary}
 
+You also have the full conversation so far for context — use it when the \
+latest reply alone is ambiguous (e.g. a short reply that only makes sense \
+next to what was just discussed). The checkout state above is still \
+authoritative for what's actually pending; the conversation is context, \
+not a substitute for it.
+
 Only set extracted_value when intent is answers_pending. Leave it null for \
 every other intent.
 """
