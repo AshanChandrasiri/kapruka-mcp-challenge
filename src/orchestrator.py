@@ -61,6 +61,44 @@ chain as a fresh `gift_request` — deliberately reused, since "the Gift-Picker
 needs another turn" is the same move either way. The only difference is
 where the cart-changed branch goes now: `start_checkout_node`
 (src/checkout/flow.py) replaces what was a Phase 2 stub.
+
+Phase 3.5 replaces the direct `stage` -> handler bypass with an LLM
+classification step: `_route_from_start` now sends every checkout stage
+(`collecting_delivery`/`awaiting_confirm`/`resolving_delivery_conflict`) to
+`checkout_router` (a second, narrower classifier, src/router/checkout_router.py)
+first — no stage still bypasses classification entirely, every turn goes
+through one classifier or the other. Problem this fixes: a free-form
+digression during `collecting_delivery` (e.g. "actually change the order")
+used to be consumed as a literal field value, since that handler had no way
+to tell "this is an answer" from "this is not an answer" — **confirmed
+live**: a "what payment methods do you accept" tangent sent mid-
+`collecting_delivery` used to land in `checkout_info[collecting_field]`
+verbatim; a real cancel request sent during `resolving_delivery_conflict`
+(before this fix routed that stage through the classifier too) got handed
+straight to the Gift-Picker, which "cancelled" by emptying the cart via
+`propose_cart` instead of a clean state clear — messier than the dedicated
+`cancel_checkout` path below. `_run_checkout_router` follows the same
+embedding pattern as `_run_intent_router` (fresh agent instance, only
+`messages[-1]` as input, only the classification fields returned) for the
+same reason: avoid polluting shared `messages` with the classifier's own
+turn. Unlike the Intent Router's `structured_response`, the Checkout
+Router's output fields (`checkout_intent`, `extracted_value`) are plain
+strings — no EphemeralValue/msgpack workaround needed, since there's no
+custom pydantic type being handed to the checkpointer.
+
+`_route_on_checkout_intent` dispatches: `cancel_checkout` (any stage) to a
+new terminal node that clears checkout state; at `resolving_delivery_conflict`,
+everything else (there's no single field pending at that stage regardless
+of classification — it's inherently a Gift-Picker mid-revision
+conversation) goes straight back to the Gift-Picker exactly as it did
+before this phase; otherwise `answers_pending` goes to whichever handler
+matches the stage, and `modify_request`/`unrelated` go to
+`handle_checkout_digression` (src/checkout/flow.py), which reuses the exact
+same Gift-Picker hand-back mechanism Phase 3 built for a failed delivery
+check and an unclear confirm reply. Hard rule, unchanged: `answers_pending`
+at `awaiting_confirm` is a routing decision, not a confirmation —
+`_is_confirmation` still independently gates `create_order` on the raw
+message text every time, not on `extracted_value`.
 """
 
 from typing import Annotated, Literal, Optional, TypedDict
@@ -70,10 +108,17 @@ from langgraph.channels.ephemeral_value import EphemeralValue
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
-from src.checkout.flow import handle_awaiting_confirm, handle_collecting_delivery, start_checkout_node
+from src.checkout.flow import (
+    cancel_checkout_node,
+    handle_awaiting_confirm,
+    handle_checkout_digression,
+    handle_collecting_delivery,
+    start_checkout_node,
+)
 from src.gift_picker.agent import build_gift_picker_agent
 from src.gift_picker.state import Cart, ProductSuggestion
 from src.prompts import CHITCHAT_RESPONSE, OUT_OF_SCOPE_RESPONSE
+from src.router.checkout_router import CheckoutIntent, build_checkout_router_agent
 from src.router.intent_router import Intent, IntentClassification, build_router_agent
 from src.session import get_checkpointer
 
@@ -99,17 +144,70 @@ class ConciergeState(TypedDict, total=False):
     stage: Optional[Stage]
     checkout_info: Optional[dict]
     collecting_field: Optional[str]
+    # Checkout Router's classification this turn (Phase 3.5) — only ever
+    # set on a turn that actually ran checkout_router; plain strings, so
+    # (unlike the Intent Router's structured_response) no EphemeralValue
+    # workaround is needed to keep them checkpoint-safe.
+    checkout_intent: Optional[CheckoutIntent]
+    extracted_value: Optional[str]
 
 
 def  _route_from_start(state: ConciergeState) -> str:
     stage = state.get("stage")
-    if stage == "collecting_delivery":
-        return "handle_collecting_delivery"
-    if stage == "awaiting_confirm":
-        return "handle_awaiting_confirm"
-    if stage == "resolving_delivery_conflict":
-        return "reset_before_gift_picker"
+    if stage in ("collecting_delivery", "awaiting_confirm", "resolving_delivery_conflict"):
+        return "checkout_router"
     return "intent_router"
+
+
+def _summarize_checkout_for_router(state: ConciergeState) -> str:
+    """Short, human-readable snapshot of the in-progress checkout for the
+    Checkout Router's prompt — deliberately not the raw cart/checkout_info
+    dicts (delivery_checked_cart etc. are orchestrator bookkeeping the
+    classifier has no use for).
+    """
+    cart = state.get("cart") or {}
+    items = ", ".join(
+        item.get("name", item.get("product_id", "?")) for item in cart.get("items", [])
+    ) or "(no items)"
+    checkout_info = state.get("checkout_info") or {}
+    collected = {
+        key: value
+        for key, value in checkout_info.items()
+        if value and not key.startswith("_") and key not in (
+            "delivery_checked", "delivery_checked_cart", "delivery_fee", "perishable_warnings",
+        )
+    }
+    return f"items=[{items}], estimated_total={cart.get('estimated_total')}, collected_so_far={collected}"
+
+
+async def _run_checkout_router(state: ConciergeState) -> dict:
+    cart_summary = _summarize_checkout_for_router(state)
+    router = build_checkout_router_agent(state["stage"], state.get("collecting_field"), cart_summary)
+    result = await router.ainvoke({"messages": state["messages"][-1:]})
+    classification = result["structured_response"]
+    return {"checkout_intent": classification.intent, "extracted_value": classification.extracted_value}
+
+
+def _route_on_checkout_intent(state: ConciergeState) -> str:
+    intent = state["checkout_intent"]
+    stage = state["stage"]
+    print(f'_route_on_checkout_intent --> {intent}')
+    print(f'_route_on_checkout_intent, stage --> {stage}')
+
+    if intent == "cancel_checkout":
+        return "cancel_checkout_node"
+
+    if stage == "resolving_delivery_conflict":
+        # No single field is pending at this stage regardless of
+        # classification (that's inherently a Gift-Picker mid-revision
+        # conversation, not a structured field answer) — everything short
+        # of an explicit cancel goes straight back to it, same as before
+        # Phase 3.5 added this classifier.
+        return "reset_before_gift_picker"
+
+    if intent == "answers_pending":
+        return "handle_awaiting_confirm" if stage == "awaiting_confirm" else "handle_collecting_delivery"
+    return "handle_checkout_digression"
 
 
 async def _run_intent_router(state: ConciergeState) -> dict:
@@ -195,8 +293,11 @@ async def build_orchestrator():
     graph.add_node("reset_before_gift_picker", _reset_before_gift_picker)
     graph.add_node("gift_picker", await build_gift_picker_agent())
     graph.add_node("start_checkout", start_checkout_node)
+    graph.add_node("checkout_router", _run_checkout_router)
     graph.add_node("handle_collecting_delivery", handle_collecting_delivery)
     graph.add_node("handle_awaiting_confirm", handle_awaiting_confirm)
+    graph.add_node("handle_checkout_digression", handle_checkout_digression)
+    graph.add_node("cancel_checkout_node", cancel_checkout_node)
     graph.add_node("no_cart_relay", _no_cart_relay)
     graph.add_node("track_order_stub", _track_order_stub)
     graph.add_node("return_item_stub", _return_item_stub)
@@ -209,8 +310,11 @@ async def build_orchestrator():
     graph.add_edge("reset_before_gift_picker", "gift_picker")
     graph.add_conditional_edges("gift_picker", _route_after_gift_picker)
     graph.add_edge("start_checkout", END)
+    graph.add_conditional_edges("checkout_router", _route_on_checkout_intent)
     graph.add_edge("handle_collecting_delivery", END)
     graph.add_edge("handle_awaiting_confirm", END)
+    graph.add_edge("handle_checkout_digression", END)
+    graph.add_edge("cancel_checkout_node", END)
     graph.add_edge("no_cart_relay", END)
     graph.add_edge("track_order_stub", END)
     graph.add_edge("return_item_stub", END)

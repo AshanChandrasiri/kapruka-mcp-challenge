@@ -2,17 +2,32 @@
 Human Confirm -> Checkout -> Track Order. No LLM judgment anywhere in this
 module except one deliberate exception: `_invoke_gift_picker_for_revision`
 re-invokes the *same* Gift-Picker sub-agent to resolve a delivery-check
-failure or an unclear confirm-step reply — reused for both, since both are
-really "hand it back to the agent that knows how to build a cart."
+failure, an unclear confirm-step reply, or (Phase 3.5) a Checkout Router
+`modify_request`/`unrelated` classification — all three funnel through the
+shared `_hand_back_to_gift_picker` helper below, since all are really "hand
+it back to the agent that knows how to build a cart."
 
 Stage values (`ConciergeState["stage"]`), checked by the orchestrator
 *before* the Intent Router runs:
-- `collecting_delivery` — one field per turn, no LLM call at all.
+- `collecting_delivery` — one field per turn, no LLM call to accept the
+  field itself (Phase 3.5: the orchestrator's Checkout Router runs first to
+  decide whether this reply is even an answer to the pending field at all).
 - `resolving_delivery_conflict` — Gift-Picker is mid-revision and didn't
   produce a new cart this turn (asked the customer something instead); the
   next reply should go straight back to it, not through classification.
 - `awaiting_confirm` — summary shown, waiting on an explicit yes/no.
 - absent — normal flow (Intent Router runs as usual).
+
+Phase 3.5: `handle_collecting_delivery` and `handle_awaiting_confirm` are
+now only reached (for `collecting_delivery`/`awaiting_confirm` stages) after
+the orchestrator's Checkout Router has classified the reply as
+`answers_pending` — see src/orchestrator.py's `_route_on_checkout_intent`.
+`handle_collecting_delivery` trusts that and reads `extracted_value` (the
+value the router pulled out of free text) rather than the raw message.
+`handle_awaiting_confirm` does NOT extend that trust to the one real
+financial action in this codebase: `_is_confirmation`'s deterministic
+keyword check still independently re-checks the customer's raw text every
+time, regardless of what the router classified this reply as.
 
 Hard rule: kapruka_create_order is only ever called from
 handle_awaiting_confirm, after _is_confirmation passes. Never call it
@@ -93,6 +108,37 @@ async def _invoke_gift_picker_for_revision(messages: list, cart: Cart, note_text
         "cart": result.get("cart"),
         "product_suggestions": result.get("product_suggestions", []),
     }
+
+
+async def _hand_back_to_gift_picker(state: dict, note_text: str) -> dict:
+    """Shared tail for every "this reply isn't progressing the pending
+    checkout step" case: an unclear confirm-step reply (Phase 3, still used
+    as handle_awaiting_confirm's own safety net when the Checkout Router
+    says answers_pending but _is_confirmation disagrees) and a Checkout
+    Router modify_request/unrelated classification during collecting_delivery
+    or awaiting_confirm (Phase 3.5, handle_checkout_digression below).
+
+    Gift-Picker re-proposed a cart -> feed it straight back into the
+    checkout gates. Gift-Picker asked the customer something instead ->
+    resolving_delivery_conflict, same as every other "hand-back" case.
+    """
+    cart = state["cart"]
+    checkout_info = state.get("checkout_info") or {}
+    revision = await _invoke_gift_picker_for_revision(state["messages"], cart, note_text)
+
+    if revision["cart"] == cart:
+        return {
+            "messages": revision["new_messages"],
+            "product_suggestions": revision["product_suggestions"],
+            "stage": "resolving_delivery_conflict",
+            "collecting_field": None,
+        }
+
+    result = await _advance_checkout(
+        revision["cart"], checkout_info, state["messages"] + revision["new_messages"]
+    )
+    result["messages"] = [*revision["new_messages"], *result.get("messages", [])]
+    return result
 
 
 def _ask(cart: Cart, checkout_info: dict, key: str, extra_messages: list) -> dict:
@@ -207,15 +253,20 @@ async def start_checkout_node(state: dict) -> dict:
 
 
 async def handle_collecting_delivery(state: dict) -> dict:
-    """One field per turn, no LLM call — except `delivery_city`/
-    `delivery_date` get a deterministic validation pass against the
-    customer's raw answer BEFORE it's accepted into checkout_info, since
-    those two feed straight into kapruka_check_delivery (Gate 2) and a
-    typo there would otherwise surface as a confusing delivery-check
-    failure instead of a simple "that's not a real city/date" reply.
+    """One field per turn, no LLM call to accept the value itself — the
+    orchestrator's Checkout Router has already classified this reply as
+    answers_pending (Phase 3.5) before routing here, so `extracted_value`
+    (the value it pulled from free text, e.g. "yeah Colombo 05" ->
+    "Colombo 05") is used in place of the raw message where available,
+    falling back to the raw text if this node is ever reached without one.
+    `delivery_city`/`delivery_date` still get a deterministic validation
+    pass against that answer BEFORE it's accepted into checkout_info, since
+    those two feed straight into kapruka_check_delivery (Gate 2) and a typo
+    there would otherwise surface as a confusing delivery-check failure
+    instead of a simple "that's not a real city/date" reply.
     """
     field = state["collecting_field"]
-    answer = state["messages"][-1].text.strip()
+    answer = (state.get("extracted_value") or state["messages"][-1].text).strip()
     cart = state["cart"]
     checkout_info = dict(state.get("checkout_info") or {})
 
@@ -288,23 +339,64 @@ async def handle_awaiting_confirm(state: dict, config: RunnableConfig) -> dict:
             "product_suggestions": [],
         }
 
+    # Safety net: the Checkout Router (Phase 3.5) classified this reply as
+    # answers_pending before routing here, but that's a routing decision,
+    # not a confirmation — _is_confirmation above is the only real gate on
+    # create_order, and it just failed, so this reply still gets the same
+    # hand-back-to-Gift-Picker treatment as any other non-yes.
     note = (
         f"The customer's reply during order confirmation wasn't a clear yes: '{reply}'. "
         "Figure out what they actually want — they might want to change an item, cancel, "
         "or ask a question — and call propose_cart again if the cart should change."
     )
-    revision = await _invoke_gift_picker_for_revision(state["messages"], cart, note)
+    return await _hand_back_to_gift_picker(state, note)
 
-    if revision["cart"] == cart:
-        return {
-            "messages": revision["new_messages"],
-            "product_suggestions": revision["product_suggestions"],
-            "stage": "resolving_delivery_conflict",
-            "collecting_field": None,
-        }
 
-    result = await _advance_checkout(
-        revision["cart"], checkout_info, state["messages"] + revision["new_messages"]
-    )
-    result["messages"] = [*revision["new_messages"], *result.get("messages", [])]
-    return result
+async def handle_checkout_digression(state: dict) -> dict:
+    """Phase 3.5: the Checkout Router classified this reply as
+    modify_request or unrelated — it isn't an attempt to answer the pending
+    step, so route it here instead of letting handle_collecting_delivery
+    swallow it as a literal field value (the bug this phase exists to fix)
+    or letting handle_awaiting_confirm's _is_confirmation silently no-op on
+    it. Reuses the exact same hand-back mechanism as an unclear confirm
+    reply or a failed delivery check — all three are "the agent that knows
+    how to build a cart should look at this, not the field-collection code."
+    """
+    stage = state["stage"]
+    if stage == "awaiting_confirm":
+        note = (
+            "The customer's reply during order confirmation wasn't a clear yes. "
+            "Figure out what they actually want — they might want to change an "
+            "item, cancel, or ask a question — and call propose_cart again if the "
+            "cart should change."
+        )
+    else:
+        field = state.get("collecting_field")
+        prompt_fn = FIELD_PROMPTS.get(field)
+        pending_question = prompt_fn(state.get("checkout_info") or {}) if prompt_fn else "a checkout detail"
+        note = (
+            f'The customer\'s reply didn\'t answer what was just asked ("{pending_question}") '
+            "— they might want to change an item, cancel, or ask about something else. "
+            "Figure out what they actually want, and call propose_cart again if the cart "
+            "should change."
+        )
+    return await _hand_back_to_gift_picker(state, note)
+
+
+def cancel_checkout_node(state: dict) -> dict:
+    """Phase 3.5: the Checkout Router's cancel_checkout classification —
+    structural clear, no LLM call (the classification itself was the only
+    judgment call needed here).
+    """
+    return {
+        "messages": [
+            AIMessage(
+                content="No problem — I've cancelled this checkout. Let me know if "
+                "you'd like to start a fresh gift search."
+            )
+        ],
+        "cart": None,
+        "checkout_info": None,
+        "stage": None,
+        "collecting_field": None,
+    }

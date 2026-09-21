@@ -1,6 +1,6 @@
 # Build Plan — Kapruka Gift Concierge (v1)
 
-**Status: v2 rebuild in progress — Phases 0-3 complete (this directory
+**Status: v2 rebuild in progress — Phases 0-3.5 complete (this directory
 started empty: no repo, no venv, no source — only
 `.env`/`CLAUDE.md`/`PLAN.md`/`docs/` carried over). Everything from Phase 4
 onward in this file is still the narrative from the earlier build, kept as
@@ -12,6 +12,7 @@ you get to it — the point of this project is working through the decisions
 yourself with Claude Code, not executing a plan written in advance.
 
 ## Phase 0 — Scaffolding (redone for v2, 2026-09-15)
+
 - [x] Repo/venv setup — `git init` + `.venv`, installed `langgraph`, `langchain`,
       `langchain-mcp-adapters`, `langchain-google-genai`, `langgraph-checkpoint-postgres`,
       `fastapi`, `uvicorn`, `python-dotenv`, `psycopg[binary]`, `gradio`, `mcp`.
@@ -54,6 +55,7 @@ yourself with Claude Code, not executing a plan written in advance.
 blocking.
 
 ## Phase 1 — Intent Router (rebuilt and tested for v2, 2026-09-15)
+
 Rebuilt from scratch — none of this existed yet in `v2` (see Phase 0 note
 above): `src/prompts.py`, `src/session.py`, `src/router/intent_router.py`,
 `src/orchestrator.py`, `src/pipeline.py`, `main.py`,
@@ -70,7 +72,7 @@ above): `src/prompts.py`, `src/session.py`, `src/router/intent_router.py`,
       single-shot even though it's a real agent node under the hood.
 - [x] **Session identity** — `src/session.py::session_identity(phone_number)`
       returns a `RunnableConfig` with `thread_id = user_id = session_id =
-      phone_number`, used by every component that touches the shared session.
+    phone_number`, used by every component that touches the shared session.
 - [x] **`PostgresSaver` checkpointer**, pointed at `DATABASE_URL` (Neon), as a
       cached async singleton (`src/session.py::get_checkpointer`, using
       `AsyncPostgresSaver` from `langgraph-checkpoint-postgres`). Verified
@@ -78,7 +80,7 @@ above): `src/prompts.py`, `src/session.py`, `src/router/intent_router.py`,
       wiring it into the orchestrator. Needed the same IPv4-forcing workaround
       as `scripts/check_db.py` (Phase 0) — `_ipv4_conninfo()` builds the
       conninfo via `psycopg.conninfo.make_conninfo(DATABASE_URL,
-      hostaddr=<resolved-A-record>)` before handing it to
+    hostaddr=<resolved-A-record>)` before handing it to
       `AsyncPostgresSaver.from_conn_string()`, which connects with a raw
       `psycopg.AsyncConnection` — no SQLAlchemy or URL-scheme rewrite
       involved at this layer. Windows-only: `WindowsSelectorEventLoopPolicy`
@@ -108,21 +110,18 @@ above): `src/prompts.py`, `src/session.py`, `src/router/intent_router.py`,
       appended exactly once, not twice. `_extract_intent` reads the router's
       `structured_response.intent` into a plain `intent` field; a
       conditional edge (`_route_on_intent`) dispatches on that string to one
-      of five terminal nodes.
-      - Not a fixed sequential chain: every downstream node would otherwise
-        run unconditionally regardless of classification.
-      - Not "routing via an agent's own reasoning" either (the
-        supervisor/conditional-edge-by-LLM pattern) — the routing decision
-        is a plain dict lookup on a string the router already returned, not
-        a second model call deciding where to go.
-      - **Found and fixed live:** embedding the router this way means its
-        `structured_response` (a custom pydantic type) gets checkpointed
-        like any other state key — LangGraph warned about persisting an
-        unregistered type via msgpack ("will be blocked in a future
-        version"). Fixed by annotating `structured_response` as
-        `EphemeralValue` (`langgraph.channels.ephemeral_value`) in
-        `ConciergeState` — it's only needed transiently within the turn to
-        feed `_extract_intent`, so it never needed persisting.
+      of five terminal nodes. - Not a fixed sequential chain: every downstream node would otherwise
+      run unconditionally regardless of classification. - Not "routing via an agent's own reasoning" either (the
+      supervisor/conditional-edge-by-LLM pattern) — the routing decision
+      is a plain dict lookup on a string the router already returned, not
+      a second model call deciding where to go. - **Found and fixed live:** embedding the router this way means its
+      `structured_response` (a custom pydantic type) gets checkpointed
+      like any other state key — LangGraph warned about persisting an
+      unregistered type via msgpack ("will be blocked in a future
+      version"). Fixed by annotating `structured_response` as
+      `EphemeralValue` (`langgraph.channels.ephemeral_value`) in
+      `ConciergeState` — it's only needed transiently within the turn to
+      feed `_extract_intent`, so it never needed persisting.
       `src/pipeline.py::run_turn(phone_number, message)` is the shared
       "run one turn" call — builds/caches the compiled orchestrator once,
       invokes it with `session_identity(phone_number)` as config, returns
@@ -141,15 +140,12 @@ above): `src/prompts.py`, `src/session.py`, `src/router/intent_router.py`,
       not in the automated harness since it needs pre-seeded session
       history) — `scripts/test_intent_router.py`, **10/10 passing**.
 - [x] Boundary/adversarial cases for `out_of_scope` vs `chitchat` — same
-      harness, all passing:
-      - "can you check this product on eBay" → `out_of_scope` (not dragged
-        into `gift_request` by "product")
-      - "is eBay better than you" → `out_of_scope`
-      - "what's the president of Sri Lanka" → `out_of_scope` (didn't just
-        answer it)
-      - "what can you do?", "thanks, bye!" → `chitchat`, not `out_of_scope`
+      harness, all passing: - "can you check this product on eBay" → `out_of_scope` (not dragged
+      into `gift_request` by "product") - "is eBay better than you" → `out_of_scope` - "what's the president of Sri Lanka" → `out_of_scope` (didn't just
+      answer it) - "what can you do?", "thanks, bye!" → `chitchat`, not `out_of_scope`
 
 ## Phase 2 — Gift-Picker Agent (rebuilt and tested for v2, 2026-09-15)
+
 Rebuilt from scratch: `src/gift_picker/{agent,tools,state}.py`,
 `src/db/recipients.py`, `src/db/conninfo.py` (promoted out of
 `src/session.py` — both the checkpointer and the new recipients connection
@@ -165,7 +161,7 @@ pool needed the same IPv4-forcing fix from Phase 0).
 - [x] Custom `get_recipient_profile` tool (`src/gift_picker/tools.py`) — DB
       access in `src/db/recipients.py` (async psycopg pool). Matches loosely
       on name OR relationship via `ILIKE`; when that comes back empty,
-      falls back to the customer's *full* recipient list rather than a
+      falls back to the customer's _full_ recipient list rather than a
       hardcoded alias table (e.g. "mom" vs a stored `relationship="mother"`)
       — lets the model do the semantic matching instead of Python. Returns
       `{"matches": [...]}`, never a forced single best match. Scoped to the
@@ -177,7 +173,7 @@ pool needed the same IPv4-forcing fix from Phase 0).
       the top-level orchestrator invocation was never bounded to begin with
       (see Phase 1), so there was nothing to undo here.
 - [x] `propose_cart` as a plain `@tool` returning `Command(update={"cart":
-      ..., "product_suggestions": [], "messages": [...]})` —
+    ..., "product_suggestions": [], "messages": [...]})` —
       `src/gift_picker/tools.py::propose_cart`. Schema includes
       `delivery_city`/`delivery_date` from day one (the v1 build added these
       later as a "retroactive amendment"; built in here since the need was
@@ -232,7 +228,7 @@ pool needed the same IPv4-forcing fix from Phase 0).
       `AIMessage` was getting appended to shared history. Harmless on its
       own, but once the Gift-Picker (a second real model call in the same
       turn) reads that history, Gemini rejects the request outright:
-      *"final request turn must be a user message or a function response"*
+      _"final request turn must be a user message or a function response"_
       — no prefill support, and history now ended in an assistant turn with
       nothing after it. Fixed by wrapping the router in `_run_intent_router`
       (`src/orchestrator.py`), which calls it with `state["messages"]` as
@@ -245,18 +241,15 @@ pool needed the same IPv4-forcing fix from Phase 0).
       of content blocks (with a `signature` field etc.), not a plain string;
       `.content` was leaking that raw structure into the reply text.
 - [x] Test: **explicit products** shape ("flower bouquet and chocolates for
-      the anniversary") — verified live, two-turn conversation:
-      1. Searched real Kapruka products, called `suggest_products` with 5
-         well-matched items, narrated text matched what was suggested,
-         correctly did *not* call `propose_cart` yet — asked a follow-up
-         about preference/budget/delivery instead.
-      2. Customer picked 2 of the suggested items and gave a delivery city
-         + date → `propose_cart` fired with the right 2 items, correct
-         `product_id`s, correct prices (LKR 5,210 + 4,150), correct total
-         (9,360), captured `delivery_city`/`delivery_date` exactly as
-         stated (not guessed). `_route_after_gift_picker` correctly detected
-         the change and logged the Phase 3 stub transition;
-         `product_suggestions` correctly cleared to `[]`.
+      the anniversary") — verified live, two-turn conversation: 1. Searched real Kapruka products, called `suggest_products` with 5
+      well-matched items, narrated text matched what was suggested,
+      correctly did _not_ call `propose_cart` yet — asked a follow-up
+      about preference/budget/delivery instead. 2. Customer picked 2 of the suggested items and gave a delivery city + date → `propose_cart` fired with the right 2 items, correct
+      `product_id`s, correct prices (LKR 5,210 + 4,150), correct total
+      (9,360), captured `delivery_city`/`delivery_date` exactly as
+      stated (not guessed). `_route_after_gift_picker` correctly detected
+      the change and logged the Phase 3 stub transition;
+      `product_suggestions` correctly cleared to `[]`.
 - [x] Test: **vague + implied bundle** shape ("surprise my mom for her
       birthday, plan a gift pack under 15000 LKR") with a seeded
       `recipients` row (relationship="mother", preferences="loves tea,
@@ -280,17 +273,19 @@ pool needed the same IPv4-forcing fix from Phase 0).
       exactly each time).
 
 ## Phase 3 — Deterministic pipeline (rebuilt and tested for v2, 2026-09-16)
-Rebuilt from scratch: `src/checkout/{mcp_client,delivery,summary,order,flow}.py`
-+ a stage pre-check wired into `src/orchestrator.py`. **Confirmed the exact
-live tool schemas up front** (`kapruka_create_order`/`kapruka_check_delivery`/
-`kapruka_track_order`) rather than trusting `docs/mcp/kapruka-mcp-tools.md`'s
-summary — resolves the v1 build's own flagged ambiguity: `order_ref`,
-`checkout_url`, `summary.grand_total` are confirmed real field names, not
-inferred. **Verified live up through a fresh `awaiting_confirm` summary,
-twice** — never sent an actual `yes` (a real financial action), matching the
-v1 build's own deliberate boundary exactly.
 
-- [x] **Raw MCP client, confirmed not assumed**
+Rebuilt from scratch: `src/checkout/{mcp_client,delivery,summary,order,flow}.py`
+
+- a stage pre-check wired into `src/orchestrator.py`. **Confirmed the exact
+  live tool schemas up front** (`kapruka_create_order`/`kapruka_check_delivery`/
+  `kapruka_track_order`) rather than trusting `docs/mcp/kapruka-mcp-tools.md`'s
+  summary — resolves the v1 build's own flagged ambiguity: `order_ref`,
+  `checkout_url`, `summary.grand_total` are confirmed real field names, not
+  inferred. **Verified live up through a fresh `awaiting_confirm` summary,
+  twice** — never sent an actual `yes` (a real financial action), matching the
+  v1 build's own deliberate boundary exactly.
+
+* [x] **Raw MCP client, confirmed not assumed**
       (`src/checkout/mcp_client.py::call_kapruka_tool`) — connected directly
       with the low-level `mcp` package (`streamable_http_client` +
       `ClientSession`, not `MultiServerMCPClient`) and inspected a real
@@ -298,14 +293,14 @@ v1 build's own deliberate boundary exactly.
       `structuredContent` comes back as `{"result": "<json string>"}` — a
       JSON string nested inside the dict, confirmed byte-for-byte, not
       guessed.
-- [x] **`stage` field on `ConciergeState`**
+* [x] **`stage` field on `ConciergeState`**
       (`collecting_delivery` | `resolving_delivery_conflict` |
       `awaiting_confirm` | absent), checked by `_route_from_start`
       (`src/orchestrator.py`) via a conditional edge from `START` itself —
-      *before* the Intent Router ever runs. Verified live: a stage in
+      _before_ the Intent Router ever runs. Verified live: a stage in
       progress correctly bypassed classification on every subsequent
       customer reply.
-- [x] **`resolving_delivery_conflict` reuses the exact same
+* [x] **`resolving_delivery_conflict` reuses the exact same
       `reset_before_gift_picker -> gift_picker -> _route_after_gift_picker`
       chain Phase 2 built for a fresh `gift_request`** — the only
       difference is which stage routes into it, and that the cart-changed
@@ -314,7 +309,7 @@ v1 build's own deliberate boundary exactly.
       correctly skipped the router, reached the Gift-Picker directly, and a
       subsequent `propose_cart` call correctly flowed back into the checkout
       pipeline.
-- [x] **Gate ordering discovered while implementing, not called out
+* [x] **Gate ordering discovered while implementing, not called out
       explicitly in the original plan text:** `kapruka_check_delivery`
       needs a city + date, but `propose_cart`'s are optional — so
       `_advance_checkout` (`src/checkout/flow.py`) has to ask for
@@ -326,10 +321,10 @@ v1 build's own deliberate boundary exactly.
       edge, same as the v1 build's own note:** the Gift-Picker sometimes
       already narrates these details when the customer states them
       up front, so re-asking can read as repetitive; not fixed here.
-- [x] **Check delivery per distinct product, not once per cart**
+* [x] **Check delivery per distinct product, not once per cart**
       (`src/checkout/delivery.py::check_delivery_for_cart`). Verified live
       twice (Colombo 03, LKR 300 both times, including after a cart swap).
-- [x] **On a failed check, hand back to the Gift-Picker** — a
+* [x] **On a failed check, hand back to the Gift-Picker** — a
       `[System note — not from the customer: ...]` `HumanMessage` (needs to
       be a real user-role turn, not a `SystemMessage`, or Gemini has nothing
       to react to) is injected before re-invoking a fresh Gift-Picker
@@ -343,25 +338,25 @@ v1 build's own deliberate boundary exactly.
       handed back to the Gift-Picker (which offered cake options without
       re-proposing yet → `stage` correctly stayed `resolving_delivery_conflict`),
       then picking one correctly triggered `propose_cart` → re-entered
-      `start_checkout_node` → re-ran the delivery check on the *new* cart →
+      `start_checkout_node` → re-ran the delivery check on the _new_ cart →
       landed on a fresh `awaiting_confirm` summary. (The actual
-      failed-*delivery*-check trigger — e.g. a real undeliverable city —
+      failed-_delivery_-check trigger — e.g. a real undeliverable city —
       wasn't separately exercised live, same deliberate scope choice the v1
       build made: it shares 100% of the code with the path that was tested.)
-- [x] **Real bug found and fixed: `delivery_checked` needs to invalidate
+* [x] **Real bug found and fixed: `delivery_checked` needs to invalidate
       itself, not rely on every call site remembering to reset it.** First
       implementation cleared a `delivery_checked` boolean by hand in
       `handle_awaiting_confirm`'s revision branch, but missed the
       `resolving_delivery_conflict` re-entry path entirely — a cart swapped
-      via that route would have skipped Gate 2 for the *new* cart, trusting
-      a delivery check that was actually run against the *old* one. Fixed
+      via that route would have skipped Gate 2 for the _new_ cart, trusting
+      a delivery check that was actually run against the _old_ one. Fixed
       by keying the flag to the cart it was actually checked against
       (`checkout_info["delivery_checked_cart"] == cart`) so it self-corrects
       regardless of entry path, and removed the now-redundant manual reset.
       Live-verified via the cake-swap test above — the delivery check
       genuinely re-ran (new perishable warning appeared) rather than being
       skipped.
-- [x] **Two real Gift-Picker robustness bugs found live, fixed in
+* [x] **Two real Gift-Picker robustness bugs found live, fixed in
       `src/gift_picker/tools.py`'s docstrings:** (1) `suggest_products`
       sometimes emitted a nested `price: {amount, currency}` object instead
       of the flat number the docstring asked for — tightened the wording,
@@ -375,20 +370,20 @@ v1 build's own deliberate boundary exactly.
       still-miscased `product_id` was never actually exercised (per the hard
       rule below), so whether Kapruka's real API is case-sensitive there
       remains unconfirmed.
-- [x] Perishable warning surfaced (not blocking) in the summary when
+* [x] Perishable warning surfaced (not blocking) in the summary when
       present. **Found and fixed a doubled prefix:** Kapruka's own
       `perishable_warning` text already reads like "Note: ...", and
       `build_summary` was prepending its own "Note: " on top — fixed to
       pass the warning through as-is.
-- [x] **Show Summary** (`src/checkout/summary.py::build_summary`) — items,
+* [x] **Show Summary** (`src/checkout/summary.py::build_summary`) — items,
       prices, delivery fee (max across items — Kapruka's own docs call it
       "flat", `max` is a cheap defensive hedge against per-call
       inconsistency), total, perishable notes, delivery/recipient/sender
       details. Verified live twice, exact output shown above.
-- [x] **Human Confirm** — deterministic keyword check
+* [x] **Human Confirm** — deterministic keyword check
       (`src/checkout/flow.py::_is_confirmation`), not a classifier call.
       **Design note on `interrupt()`:** deliberately not used — LangGraph's
-      interrupt/resume machinery is built for pausing *inside* an agent's
+      interrupt/resume machinery is built for pausing _inside_ an agent's
       own tool-calling turn; using it here would mean either routing
       `kapruka_create_order` through an LLM's tool call (reintroducing agent
       judgment into checkout, which this phase exists to avoid) or standing
@@ -398,11 +393,11 @@ v1 build's own deliberate boundary exactly.
       (`src/checkout/order.py::create_order`, called only from
       `handle_awaiting_confirm` after `_is_confirmation` passes) — verifiable
       by inspection.
-- [x] `Checkout` calls `kapruka_create_order` via the raw MCP client — see
+* [x] `Checkout` calls `kapruka_create_order` via the raw MCP client — see
       the schema-confirmation note at the top of this phase for why the
-      response field names are now *confirmed*, not inferred like the v1
+      response field names are now _confirmed_, not inferred like the v1
       build left them.
-- [x] On success: writes `phone_number`, `items` (JSONB), `product_summary`,
+* [x] On success: writes `phone_number`, `items` (JSONB), `product_summary`,
       `total_amount` (the real `summary.grand_total` from the order
       response, not the cart's own pre-delivery-fee `estimated_total`),
       `delivery_city`, `delivery_date`, `kapruka_order_id` (`order_ref`),
@@ -411,7 +406,7 @@ v1 build's own deliberate boundary exactly.
       IPv4-forcing pattern as `src/db/recipients.py`). Clears
       `cart`/`checkout_info`/`stage`/`collecting_field`/`product_suggestions`
       structurally on success.
-- [x] `Track Order` here (`src/checkout/order.py::track_order_once`) is a
+* [x] `Track Order` here (`src/checkout/order.py::track_order_once`) is a
       best-effort immediate status check right after checkout — catches any
       exception and returns `None`, since "order not found yet" is expected
       (payment likely isn't complete) rather than an error. **Untested
@@ -424,18 +419,211 @@ v1 build's own deliberate boundary exactly.
 explicit human confirm. Never let the agent call checkout directly, and
 never skip the confirmation step "to save a round trip."**
 
+## Phase 3.5 — Stage-aware checkout routing (LLM-classified, not stage-bypassed, built and verified live 2026-09-20)
+
+**Problem being fixed:** `_route_from_start` currently branches straight to
+the deterministic checkout handlers whenever `stage` is set, without ever
+consulting an LLM. A free-form reply during `collecting_delivery` (e.g.
+"actually I want to change the order") gets consumed as a literal field
+value instead of being recognized as a digression — the failure isn't
+caught until a downstream step chokes on it (a bad `kapruka_check_delivery`
+call, or worse, silently accepted junk sitting in `checkout_info`).
+
+**Decision:** every turn goes through an LLM classification before the
+orchestrator decides how to route — no more direct `stage`-only bypass of
+judgment. Rather than growing the existing 5-way Intent Router to also
+cover checkout, add a second, narrower classifier scoped only to turns
+where `stage` is set. Keeps each prompt focused on one job instead of one
+router trying to hold "cold start" and "mid-checkout" classification in
+the same head.
+
+- [x] `src/router/checkout_router.py::CheckoutIntentClassification`
+      (pydantic) — `Literal["answers_pending", "modify_request",
+      "cancel_checkout", "unrelated"]` intent field, plus
+      `extracted_value: str | None` (populated only when intent is
+      `answers_pending` — the actual value pulled from free text, e.g.
+      "yeah ship it to Colombo 05" → `"Colombo 05"`, so classification and
+      extraction happen in one LLM call instead of two). Same
+      `create_agent(llm, tools=[], response_format=...)` shape as the
+      Intent Router — zero tools, so single-shot by construction.
+- [x] `classify_checkout_intent(phone_number, message, stage,
+      collecting_field, cart_summary)` — standalone path (mirrors
+      `classify_intent`, used by `scripts/test_checkout_router.py`) built
+      on `build_checkout_router_agent(stage, collecting_field,
+      cart_summary)`, which formats `CHECKOUT_ROUTER_INSTRUCTIONS`
+      (`src/prompts.py`) per call with the current `stage`/pending-field/
+      cart snapshot serialized in — none of that lives in the message
+      transcript, so without it "does this answer the pending question" is
+      meaningless to the model. `phone_number` is accepted but unused in
+      the body (context is passed explicitly here, not read from the
+      checkpointer the way `classify_intent` does) — kept only so the two
+      routers' standalone test harnesses share a signature shape.
+- [x] `_route_from_start` (`src/orchestrator.py`) — when `stage` is set,
+      routes to the new `checkout_router` node instead of straight to the
+      deterministic handlers; `stage` absent is unchanged (existing 5-way
+      Intent Router, untouched). **Widened during implementation, not as
+      originally scoped:** all three stages route through the classifier
+      now, including `resolving_delivery_conflict` — see the live finding
+      below for why the original plan (only `collecting_delivery`/
+      `awaiting_confirm`) wasn't enough.
+- [x] `_run_checkout_router` (`src/orchestrator.py`) embeds the classifier
+      the same way `_run_intent_router` embeds the Intent Router: fresh
+      agent instance per call, only `messages[-1]` as input, only
+      `checkout_intent`/`extracted_value` returned to state — the
+      classifier's own turn never touches shared `messages`. Those two
+      fields are plain strings, so (unlike the Intent Router's
+      `structured_response`) no `EphemeralValue` workaround was needed —
+      there's no custom pydantic type reaching the checkpointer.
+- [x] New conditional edge off `checkout_router` (`_route_on_checkout_intent`):
+      `cancel_checkout` (any stage) → new `cancel_checkout_node`, clears
+      `stage`/`cart`/`checkout_info`/`collecting_field`, canned reply — no
+      LLM call, the classification itself was the only judgment needed.
+      `answers_pending` at `collecting_delivery`/`awaiting_confirm` →
+      existing handler, using `extracted_value` in place of the raw message
+      (`awaiting_confirm`'s own `_is_confirmation` gate still reads the raw
+      text regardless — see hard-rule note below).
+      `modify_request`/`unrelated` → new `handle_checkout_digression`
+      (`src/checkout/flow.py`), which — along with `handle_awaiting_confirm`'s
+      own non-confirmation fallback — now shares one `_hand_back_to_gift_picker`
+      helper (refactored out of what was `handle_awaiting_confirm`'s
+      inline tail) instead of duplicating the "did the Gift-Picker
+      re-propose or just ask something" branch twice.
+      At `resolving_delivery_conflict`, every non-cancel classification
+      (including `answers_pending`) routes to `reset_before_gift_picker`
+      regardless — there's no single field pending at that stage no matter
+      what the classifier says, so the only thing worth extracting from it
+      there is "did the customer just cancel."
+
+**Live finding, changed the plan mid-implementation:** the original scope
+only ran the Checkout Router for `collecting_delivery`/`awaiting_confirm`,
+leaving `resolving_delivery_conflict` on its pre-3.5 direct-to-Gift-Picker
+path (reasoning at the time: that stage is already "an LLM in the loop," so
+there's no bypass-of-judgment to fix). A live end-to-end run
+(`scripts/test_checkout_router_e2e.py`) exposed why that wasn't enough: a
+real "actually never mind, cancel this order" sent during
+`resolving_delivery_conflict` went straight to the Gift-Picker, which
+"cancelled" by calling `propose_cart` with an empty item list instead of
+clearing checkout state — the new (empty) cart still carried the old
+`checkout_info` forward via `_advance_checkout`'s gates, so the customer
+got asked for `recipient_name` again on an order that was supposedly
+cancelled. Routing `resolving_delivery_conflict` through the Checkout
+Router too (catching `cancel_checkout` there, letting everything else fall
+through to the Gift-Picker exactly as before) fixed it — confirmed live,
+see the test transcript below. This also matches what CLAUDE.md already
+says ("every turn now goes through one classifier or the other") more
+literally than the original three-bullet plan did.
+
+**Found but explicitly out of scope for this phase:** the same live run
+(first attempt, before the two-turn rephrase below) hit a pre-existing
+Phase 2 bug, not caused by anything in this phase — `suggest_products` and
+`propose_cart` (`src/gift_picker/tools.py`) both write to
+`product_suggestions` via `Command(update={...})`, and neither the field
+nor `GiftPickerState` declares a reducer for it. When the model calls both
+tools in the same turn (a request phrased to invite an immediate "propose a
+cart" alongside showing options), LangGraph raises
+`InvalidUpdateError: At key 'product_suggestions': Can receive only one
+value per step`. Worked around in the test by phrasing the request as
+Phase 2's own two-turn shape (search, then confirm) instead of fixing the
+underlying tool design — not a Phase 3.5 concern, flagging here for
+whoever picks it up next.
+
+**Hard rule, unchanged from Phase 3 — restated because this phase touches
+the same code path:** `answers_pending` at the `awaiting_confirm` stage is
+a routing decision, not a confirmation. `_is_confirmation`'s deterministic
+keyword check must still independently pass on the raw text before
+`handle_awaiting_confirm` calls `create_order`. The new classifier is
+upstream traffic-routing only — it never becomes a second, softer gate on
+the one real financial action in this codebase. **Verified by direct unit
+check** (`_is_confirmation`, not through the live graph — same deliberate
+boundary as the rest of this codebase's checkout testing, never fire a real
+`create_order`): non-confirmation replies the Checkout Router would
+plausibly still tag `answers_pending` ("no, hold on, I want to add a card
+too", "actually cancel this please") correctly still fail
+`_is_confirmation`, while actual yes-shaped replies ("yes", "yes lol",
+"sounds good") still pass it — the two gates are independent, exactly as
+designed.
+
+**Known cost tradeoff, accepted deliberately:** every mid-checkout turn now
+costs one extra LLM call, including the common case (a bare city name).
+Chosen over a per-field heuristic (regex/pattern matching per field type)
+because user input at this step is genuinely open-ended, not just format
+variance — a heuristic list would always have gaps a real classifier
+doesn't.
+
+**Touches, but doesn't fully resolve, an existing known rough edge:** the
+"Gift-Picker sometimes already narrates delivery details when the customer
+states them up front, so re-asking can read as repetitive" note from
+Phase 3 — this phase stops _misrouting_ that case, but doesn't by itself
+stop `collecting_delivery` from re-asking for a field the customer already
+gave earlier in the conversation. Separate fix if it turns out to matter.
+
+- [x] Test: mid-`collecting_delivery`, a reply that plausibly is the city →
+      `answers_pending`, correct extraction, state advances normally.
+      `scripts/test_checkout_router.py` (classifier alone, live Gemini
+      calls): "yeah ship it to Colombo 05" → `answers_pending` /
+      `"Colombo 05"`; a phrased-out date and a bare phone number also
+      correctly classified+extracted. **Full graph confirmed live too**
+      (`scripts/test_checkout_router_e2e.py`): a real conversation reached
+      `collecting_delivery` (asking for `recipient_name`) and advanced
+      normally on a real answer.
+- [x] Test: mid-`collecting_delivery`, "I want to change the order" →
+      `modify_request`, hands back to Gift-Picker. Classifier alone
+      (`scripts/test_checkout_router.py`, live): "actually I want to change
+      the order, swap the chocolates for something else" mid-
+      `collecting_delivery` → correctly tagged `modify_request`. (The full
+      graph exercised the sibling `unrelated` path live instead, below —
+      both intents route to the same `handle_checkout_digression`, so that
+      run validates the shared hand-back mechanism for both.)
+- [x] Test: mid-`awaiting_confirm`, a genuine "yes" → still requires
+      `_is_confirmation` to independently pass; classifier's
+      `answers_pending` alone does not trigger checkout. Classifier
+      correctly returns `answers_pending`/`"yes"` for a bare "yes" at this
+      stage (live); `_is_confirmation`'s independence verified by direct
+      unit check (see hard-rule note above) — never exercised through a
+      real `create_order` call, same boundary as every other checkout test
+      in this codebase.
+- [x] Test: "actually cancel this" → `cancel_checkout`, state fully
+      cleared, canned reply. Classifier-level: confirmed at both
+      `collecting_delivery` and `awaiting_confirm` stages
+      (`scripts/test_checkout_router.py`). **Full graph, live:** a real
+      "actually never mind, please cancel this order" sent during
+      `resolving_delivery_conflict` (reached via the digression test above)
+      correctly routed to the new `cancel_checkout_node` — `stage`,
+      `cart`, and `checkout_info` all confirmed `None`/empty afterward, and
+      the canned cancellation reply was returned. This is also the run that
+      surfaced the live finding above (why `resolving_delivery_conflict`
+      needed to join the classified stages).
+- [x] Test: a genuine tangent mid-checkout (e.g. "what's the weather like")
+      → `unrelated`, handled gracefully. Classifier live: "what's the
+      weather like today" mid-`collecting_delivery` → `unrelated`. **Full
+      graph confirmed live too** (`scripts/test_checkout_router_e2e.py`): a
+      real "wait, actually what payment methods do you accept?" sent
+      mid-`collecting_delivery` while `recipient_name` was pending did NOT
+      land in `checkout_info["recipient_name"]` (the bug this phase exists
+      to fix) — it routed to `handle_checkout_digression` → Gift-Picker,
+      which answered the payment-methods question directly without
+      re-proposing, and `stage` correctly moved to
+      `resolving_delivery_conflict` per existing Phase 3 semantics, same
+      mechanism as `modify_request` (no separate lighter fallback needed —
+      the Gift-Picker handles an off-topic question fine on its own, as
+      shown by the live payment-methods digression above).
+
 ## Phase 4 — Track-order branch
+
 - [ ] Order-number extraction (ask if missing) → `kapruka_track_order` →
       format reply
 
 ## Phase 5 — Return-item branch
+
 - [ ] Fallback response only — no MCP tool exists for this, don't build one
 
 ## Phase 6 — Wire the full graph + end-to-end test
+
 - [ ] FastAPI webhook → Entry → Intent Router → the five branches
 - [ ] Manually test all five intents through the real webhook, not just
       the graph in isolation
 
 ## Deferred — later, separate milestone
+
 - Cron-triggered proactive reminders (draft, send, wait for reply)
 - Re-classifying a reply through the Intent Router (confirm vs. new request)

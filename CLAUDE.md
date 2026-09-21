@@ -1,6 +1,7 @@
 # Kapruka Gift Concierge — Project Context
 
 ## What this is
+
 A multi-intent conversational agent built on the public Kapruka MCP server
 (`https://mcp.kapruka.com/mcp`) — real inventory, real delivery quoting, real
 guest checkout, not a mock API. Purpose: deliberately practice a production-
@@ -8,6 +9,7 @@ shaped agentic system (agent-vs-router judgment, human-in-the-loop gating on
 a real financial action, MCP tool integration) as a portfolio-grade project.
 
 ## Tech stack
+
 - **Orchestration:** LangGraph (`langgraph`) + LangChain — LangGraph agent node for the one
   real reasoning loop, plain async Python for the deterministic pipeline, a
   custom `StateGraph` (`ConciergeOrchestrator` graph, see below) for
@@ -37,7 +39,7 @@ a real financial action, MCP tool integration) as a portfolio-grade project.
 - **State / profile store:** PostgreSQL, hosted on Neon. `src/db/schema.sql`
   holds the hand-rolled `recipients`/`orders` tables (family profile, order
   history). LangGraph's `PostgresSaver` checkpointer — `src/session.py`,
-  `get_checkpointer()`, a cached singleton — points at the *same* Neon
+  `get_checkpointer()`, a cached singleton — points at the _same_ Neon
   instance for turn-by-turn conversation state, so both live in one
   database, in separate tables (LangGraph owns its checkpoint schema; ours
   is `recipients`/`orders`). Session identity convention, used by every
@@ -50,6 +52,7 @@ a real financial action, MCP tool integration) as a portfolio-grade project.
   dev; the model integration can be switched later if needed
 
 ## Kapruka MCP server
+
 - Endpoint: `https://mcp.kapruka.com/mcp` — Streamable HTTP, no auth required
 - Rate limits: 60 requests/min per IP (all tools), 30 `kapruka_create_order`
   calls/hour per IP
@@ -57,7 +60,9 @@ a real financial action, MCP tool integration) as a portfolio-grade project.
 - Full tool contracts: `docs/mcp/kapruka-mcp-tools.md`
 
 ## Agents — only ONE real reasoning loop in this system
+
 ### Gift-Picker Agent
+
 - The only agentic (ReAct-style) node: a LangGraph agent node
   (`src/gift_picker/agent.py::build_gift_picker_agent`) that searches,
   evaluates results, refines, decides when the cart is good enough
@@ -89,7 +94,9 @@ a real financial action, MCP tool integration) as a portfolio-grade project.
   downstream reachability; that path is still deferred (see Scope below).
 
 ## Routers — NOT agentic. Single-shot, no loop.
+
 ### Intent Router
+
 - One structured-output LLM call (`src/router/intent_router.py`). Implemented
   as a LangGraph agent node (structured output, no `tools`) run through
   compiled LangGraph + the shared `PostgresSaver` checkpointer — same primitives as the
@@ -98,14 +105,14 @@ a real financial action, MCP tool integration) as a portfolio-grade project.
   attached there is nothing for it to call, so it cannot enter a ReAct loop
   no matter what class runs it. Prompt lives in `src/prompts.py`.
 - Bounded history, but only on the standalone path: `classify_intent(
-  phone_number, message)` (`src/router/intent_router.py`) makes its own
+phone_number, message)` (`src/router/intent_router.py`) makes its own
   compiled LangGraph call with graph invocation configurationget_session_config=checkpoint/history configuration(
   num_recent_events=4))` (LangGraph checkpointer configuration lives at
-  LangGraph checkpointer configuration) — used for
-  isolated testing (`scripts/test_intent_router.py`) and anywhere the router
-  runs outside the orchestrator, where the token-cost saving is real and
-  unconditional. (the graph's message-history handling turned out to be binary —
-  `'default'`/`'none'` — not a partial-N lever, so it's unused.)
+LangGraph checkpointer configuration) — used for
+isolated testing (`scripts/test_intent_router.py`) and anywhere the router
+runs outside the orchestrator, where the token-cost saving is real and
+unconditional. (the graph's message-history handling turned out to be binary —
+`'default'`/`'none'` — not a partial-N lever, so it's unused.)
   **Production path (via the orchestrator) sees full history instead** —
   see Orchestrator section below for why.
 - `build_router_agent()` builds a fresh LangGraph agent node instance per call (LangGraph
@@ -124,7 +131,31 @@ a real financial action, MCP tool integration) as a portfolio-grade project.
 - This is the only place free-text ambiguity gets interpreted — everything
   downstream of it is either the agent loop or a deterministic pipeline.
 
-## Orchestrator — dispatches on the Intent Router's result
+### Checkout Router
+
+- A second structured-output classifier (`src/router/checkout_router.py`),
+  same class as the Intent Router (LangGraph agent node, structured output,
+  no tools — genuinely single-shot for the same reason), but used only when
+  graph state's `stage` is set (a checkout is in progress). Deliberately a
+  separate classifier rather than folding checkout-time classification into
+  the Intent Router's 5-way schema — keeps each prompt focused on one job:
+  cold-start intent vs. mid-checkout digression.
+- Classifies into `answers_pending | modify_request | cancel_checkout |
+unrelated`. `answers_pending` also carries `extracted_value`, so a single
+  call both classifies the reply and pulls the structured value out of free
+  text (e.g. "yeah ship it to Colombo 05" → `extracted_value: "Colombo
+05"`) instead of a second round-trip.
+- Needs `stage`, `collecting_field` (which field is actually pending), and a
+  `cart`/`checkout_info` snapshot serialized explicitly into its prompt —
+  none of that lives in the message transcript the way Intent Router
+  context does.
+- **Never a confirmation gate.** `answers_pending` at the `awaiting_confirm`
+  stage is a routing decision, not itself a "yes." See Human Confirm below
+  — `_is_confirmation`'s deterministic keyword check is still the only
+  thing that can trigger `create_order`.
+
+## Orchestrator — dispatches on the active classifier's result
+
 `src/orchestrator.py::ConciergeOrchestrator`, a custom LangGraph `StateGraph`
 builder — the root graph in `main.py` (and later the FastAPI webhook) drives
 via the compiled graph for every turn, with no history bound on that top-level call
@@ -135,6 +166,18 @@ state, then dispatches: canned
 response for `chitchat`/`out_of_scope`, the Gift-Picker sub-agent for
 `gift_request`, a stub (log line + placeholder reply) for
 `track_order`/`return_item` until their phases land.
+
+**Entry routing, before either classifier runs:** `_route_from_start` (a
+conditional edge from `START` itself) checks graph state's `stage` first.
+`stage` absent → the Intent Router runs as described above. `stage` set (a
+checkout already in progress) → the Checkout Router runs instead (see
+Routers section above), and its result dispatches to
+`_advance_checkout`/`handle_awaiting_confirm` (`answers_pending`), back to
+the Gift-Picker sub-agent (`modify_request`/`unrelated` — reusing the same
+hand-back mechanism the Deterministic pipeline section describes for a
+failed delivery check), or a new cancel branch that clears checkout state
+(`cancel_checkout`). Earlier, a stage in progress bypassed classification
+entirely; every turn now goes through one classifier or the other.
 
 Not a purely sequential graph — every node in a fixed sequence would run
 unconditionally, with no way to skip based on the classification result. Not the
@@ -159,15 +202,16 @@ lives on in `classify_intent()`'s own standalone compiled LangGraph call, which 
 what `scripts/test_intent_router.py` exercises.
 
 ### `gift_request` dispatch (`ConciergeOrchestrator._run_gift_picker`)
+
 1. Yields its own housekeeping a graph state update
-   {"product_suggestions": []}))` before invoking the Gift-Picker — a
-   structural reset, not something left to the model to remember. Confirmed
-   (by reading the LangGraph compiled LangGraph source) that a yielded event's state update
-   is applied to graph state via `append_event` *before* the
+   {"product_suggestions": []}))`before invoking the Gift-Picker — a
+structural reset, not something left to the model to remember. Confirmed
+(by reading the LangGraph compiled LangGraph source) that a yielded event's state update
+is applied to graph state via`append_event` _before_ the
    generator resumes, so the Gift-Picker sub-agent genuinely sees the reset.
 2. Runs the Gift-Picker as a sub-agent sharing shared graph state, watching its yielded
    events for a `"cart"` key in `the node's returned state update` — i.e. did
-   `propose_cart` actually fire *this turn* — rather than checking whether
+   `propose_cart` actually fire _this turn_ — rather than checking whether
    graph state's `cart` merely exists (which could be stale from an
    earlier turn and would wrongly suppress a genuinely new cart later in
    the same conversation).
@@ -179,18 +223,19 @@ what `scripts/test_intent_router.py` exercises.
    there's a real UI.
 
 ## Deterministic pipeline — no LLM judgment involved
+
 `Check Delivery` (`kapruka_check_delivery`) → `Show Summary` → `Human Confirm`
 → `Checkout` (`kapruka_create_order`) → `Track Order` (`kapruka_track_order`)
 
 `src/checkout/` — plain async Python calling MCP tools directly via a raw
 `mcp` client (`mcp_client.py`), not `MultiServerMCPClient` from `langchain-mcp-adapters`. No agent loop, no
 LLM judgment, with one exception: resolving a conflict re-invokes the
-*same* Gift-Picker sub-agent (reuse, not a new feature — see below).
+_same_ Gift-Picker sub-agent (reuse, not a new feature — see below).
 
 **Why a raw MCP client instead of `MultiServerMCPClient`:** every Kapruka tool wraps
 its arguments in a single `params` object and supports
 `response_format: "json"` (confirmed against the live tool schemas — not
-guessed), and the JSON payload comes back double-encoded as a JSON *string*
+guessed), and the JSON payload comes back double-encoded as a JSON _string_
 inside `structuredContent["result"]`, not `structuredContent` itself
 (confirmed via a live call). `MultiServerMCPClient` is built for an LLM's tool-calling
 loop (schema exposure to the model, `interrupt()` tied into LangGraph's
@@ -198,27 +243,33 @@ own flow processor); none of that applies to a deterministic call site, so
 `src/checkout/mcp_client.py::call_kapruka_tool()` talks to the server
 directly instead.
 
-**State machine** (graph state's `stage`, `src/checkout/flow.py`),
-checked by the Orchestrator *before* the Intent Router runs (see
-Orchestrator section above): `collecting_delivery` | `resolving_delivery_conflict`
-| `awaiting_confirm` | absent (normal flow). `Check Delivery` runs once per
-*distinct product*, not once per cart — deliverability is scoped per item,
-not per shipment (food/liquor/hotel-cake items reach far fewer cities than
-flowers). A failed check injects a `[System note — not from the customer: ...]`
-event describing what failed, then re-invokes the Gift-Picker sub-agent —
-the same move used when a confirm-step reply isn't a clear yes, since both
-are really "hand it back to the agent that knows how to build a cart."
+**State machine** (graph state's `stage`, `src/checkout/flow.py`), checked
+by `_route_from_start` to decide which classifier runs a given turn — the
+Checkout Router when a stage is set, the Intent Router otherwise (see
+Orchestrator section above): `collecting_delivery` |
+`resolving_delivery_conflict` | `awaiting_confirm` | absent (normal flow).
+`Check Delivery` runs once per _distinct product_, not once per cart —
+deliverability is scoped per item, not per shipment (food/liquor/hotel-cake
+items reach far fewer cities than flowers). A failed check injects a
+`[System note — not from the customer: ...]` event describing what failed,
+then re-invokes the Gift-Picker sub-agent — the same hand-back mechanism
+the Checkout Router's `modify_request`/`unrelated` results also use, since
+all three cases are really "hand it back to the agent that knows how to
+build a cart."
 
 **`collecting_delivery` collects more than the plan originally named:**
 the live `kapruka_create_order` schema (checked directly, not assumed)
 requires `recipient{name,phone}`, `delivery{address,city,date}`,
 `sender{name}` — not just city/date. `propose_cart` only captures
 city/date (see the Gift-Picker section above); `collecting_delivery` asks
-for whatever else is missing, one field per turn, no LLM call. Known rough
-edge: the Gift-Picker often already states these details in its own
-narration when the customer gives them up front, so re-asking can read as
-repetitive — not fixed here, would mean growing `propose_cart`'s schema
-further.
+for whatever else is missing, one field per turn. The field write itself
+still has no LLM judgment — the Checkout Router (see Routers section
+above) is what classifies the reply and extracts the value before
+`_advance_checkout` ever writes it. Known rough edge, still open: the
+Gift-Picker often already states these details in its own narration when
+the customer gives them up front, so re-asking can read as repetitive —
+not fixed by the Checkout Router, would mean growing `propose_cart`'s
+schema further.
 
 **Human Confirm — why not LangGraph's `interrupt()`:** that mechanism's
 pause/resume lives inside LangGraph's graph execution and interrupt mechanism
@@ -230,12 +281,15 @@ checkout, which this phase is explicitly avoiding) or standing up LangGraph
 resumability just for this one call. Instead, "explicit human confirm" is
 enforced structurally: a deterministic keyword check
 (`src/checkout/flow.py::_is_confirmation`, not a classifier call) gates the
-*only* call site `kapruka_create_order` has anywhere in this codebase
+_only_ call site `kapruka_create_order` has anywhere in this codebase
 (`src/checkout/order.py::create_order`, called only from
 `handle_awaiting_confirm` after that check passes) — verifiable by
 inspection, and live-verified that the gate itself holds (a bare "yes"
 with no checkout in progress does nothing; a non-yes reply during confirm
-does not check out).
+does not check out). **Unchanged by the Checkout Router (see Routers
+section above):** its `answers_pending` classification only decides that a
+reply should reach `handle_awaiting_confirm` at all — `_is_confirmation`
+still independently gates `create_order` on the raw text every time.
 
 On success: writes `phone_number`, `items` (JSONB), `product_summary`,
 `total_amount`, `delivery_city`, `delivery_date`, `kapruka_order_id`,
@@ -245,7 +299,7 @@ table gained those four columns via an `ALTER TABLE` in
 `stage`/`collecting_field`. `Track Order` here
 (`src/checkout/order.py::track_order_once`) is a best-effort immediate
 status check right after checkout — distinct from Phase 4's `track_order`
-*intent*, which is a customer asking about a past order out of the blue.
+_intent_, which is a customer asking about a past order out of the blue.
 Same MCP tool, two different callers.
 
 **Untested against a live success response, by design:** `kapruka_create_order`
@@ -263,11 +317,13 @@ human confirm. Never let the agent call checkout directly, and never skip
 the confirmation step "to save a round trip."**
 
 ## Known capability gap
+
 Kapruka MCP has no return/refund tool. `return_item` is a fallback branch
 (share return policy / hand off to a human), not a working agent — don't try
 to build a "return agent" against a tool that doesn't exist.
 
 ## Scope for this build (v1)
+
 Interactive/conversational path only. The cron-triggered proactive reminder
 flow (drafting gift suggestions for saved occasions) is deferred to a later
 milestone — see `docs/architecture/target-architecture.drawio` for the full
@@ -280,6 +336,7 @@ from before the move to LangGraph + LangChain — needs a manual pass in the dra
 to relabel; not safe to hand-edit as raw XML.
 
 ## Working conventions
+
 - Current phase and status live in `PLAN.md` — check it at the start of a
   session, update it at the end.
 - When something in here goes stale (a decision changes, scope shifts),

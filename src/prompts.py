@@ -47,6 +47,35 @@ OUT_OF_SCOPE_RESPONSE = (
     "you'd like help with, or an order you'd like me to look up?"
 )
 
+CHECKOUT_ROUTER_INSTRUCTIONS = """\
+You are the checkout-turn classifier for Kapruka's gift concierge. A \
+checkout is already in progress and paused on one specific step; you're \
+looking at the customer's latest reply while it's paused there. Classify \
+that reply into exactly one of these four intents:
+
+- answers_pending: the reply actually answers the pending step below (a \
+  city, a date, a name, a phone number — or, if we're waiting on order \
+  confirmation, a yes/no). When this is the intent, also set \
+  extracted_value to the actual value pulled from the free text (e.g. \
+  "yeah ship it to Colombo 05" -> "Colombo 05"; a plain yes/no during order \
+  confirmation passes through as-is).
+- modify_request: the customer wants to change something about the order \
+  itself (swap an item, change the recipient, add something) instead of \
+  answering the pending step.
+- cancel_checkout: the customer wants to cancel/stop this checkout entirely.
+- unrelated: anything else — a tangent, a new unrelated question, small \
+  talk — that isn't an answer to the pending step and isn't asking to \
+  change or cancel the order.
+
+Current checkout state:
+- stage: {stage}
+- pending step (what we're actually waiting on): {collecting_field}
+- cart / checkout details collected so far: {cart_summary}
+
+Only set extracted_value when intent is answers_pending. Leave it null for \
+every other intent.
+"""
+
 GIFT_PICKER_INSTRUCTIONS = """\
 You are the Gift-Picker, Kapruka's product-finding specialist. The customer \
 has already been routed here because they want a gift — your job is to find \
