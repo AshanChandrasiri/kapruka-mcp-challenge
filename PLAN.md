@@ -1,6 +1,6 @@
 # Build Plan — Kapruka Gift Concierge (v1)
 
-**Status: v2 rebuild in progress — Phases 0-3.5 complete (this directory
+**Status: v2 rebuild in progress — Phases 0-3.6 complete (this directory
 started empty: no repo, no venv, no source — only
 `.env`/`CLAUDE.md`/`PLAN.md`/`docs/` carried over). Everything from Phase 4
 onward in this file is still the narrative from the earlier build, kept as
@@ -607,6 +607,344 @@ gave earlier in the conversation. Separate fix if it turns out to matter.
       mechanism as `modify_request` (no separate lighter fallback needed —
       the Gift-Picker handles an off-topic question fine on its own, as
       shown by the live payment-methods digression above).
+
+## Phase 3.6 — Agentic checkout-info gathering & confirm; Checkout Router retired (built and verified live 2026-09-23)
+
+**Supersedes most of Phase 3.5, and the deterministic field-collection
+machinery from Phase 3 — a replacement, not an addition.** Removed
+entirely: `src/router/checkout_router.py`, `CHECKOUT_ROUTER_INSTRUCTIONS`,
+`_run_checkout_router`, `_route_on_checkout_intent`, the `checkout_router`
+node, `handle_checkout_digression`, `_invoke_gift_picker_for_revision`,
+`_hand_back_to_gift_picker`, `cancel_checkout_node` as a router-reached
+node, and the `collecting_delivery` / `resolving_delivery_conflict` /
+`awaiting_confirm` stage names. **Also removed** (not called out in the
+first draft of this phase — Gate 3 folding into the same agent as Gate 1/2
+means none of Phase 3's one-field-per-turn machinery survives, not just the
+city/date half of it): `_advance_checkout`, `handle_collecting_delivery`,
+`_ask`, `FIELD_PROMPTS`. `_invalid_date_reason` as a standalone function is
+also retired — its calendar-validity check is adapted into a tool guard
+below, not kept verbatim. Kept unchanged from Phase 3: `_is_confirmation`,
+`resolve_city`, `check_delivery_for_cart`, `build_summary`, `create_order`/
+`save_order`/`track_order_once`, and the hard rule itself.
+
+**Problem being fixed, concretely — not hypothetically:**
+`_invalid_date_reason`'s strict `datetime.strptime(text, "%Y-%m-%d")`
+rejects "next thursday" outright. "First, can I check my cart" gets
+classified `modify_request`/`unrelated` by the Checkout Router and bounced
+through the full `handle_checkout_digression` → `_invoke_gift_picker_for_revision`
+round-trip just to answer a question about a cart the customer already
+has. A fixed taxonomy (`answers_pending` / `modify_request` /
+`cancel_checkout` / `unrelated`) plus one-field-per-turn deterministic
+collection can't cover open-ended replies without either growing
+indefinitely or routing normal conversation through an awkward extra hop —
+and that applies just as much to `recipient_name`/`delivery_address` as it
+does to city/date, which is why Gate 3 folds in here too rather than
+staying deterministic.
+
+**Decision:** replace the classifier + deterministic-field machinery with
+per-stage agents that own their own judgment, each scoped to a narrow tool
+set — same shape as the Gift-Picker, not a new pattern. The Checkout
+Router is retired outright, not extended. Exactly one thing in the whole
+pipeline stays deterministic: the literal trigger for `create_order`.
+
+### Gift-Picker changes
+- [x] `propose_cart`'s schema drops `delivery_city`/`delivery_date` —
+      Gift-Picker goes back to cart-only, no delivery fields at all.
+      `Cart` (`src/gift_picker/state.py`) dropped the two fields too, not
+      just the tool signature — nothing would have populated them anymore.
+- [x] New tool, `confirm_cart_and_proceed()` (`Command`-based, same shape
+      as `propose_cart`) — called when the customer approves the *current*
+      cart with nothing further to change. **Verified live**: a real
+      two-turn "here's a cart" / "yes, let's proceed" exchange correctly
+      called `propose_cart` on the first turn and `confirm_cart_and_proceed`
+      only on the second, explicit-approval turn — confirms the docstring's
+      "don't call this just because a turn is ending" guidance is being
+      followed, not just hoped for.
+- [x] New tools, shared with the Checkout Info/Confirm agents below (own
+      module, `src/checkout/shared_tools.py`, not owned by
+      `gift_picker/tools.py` since three different agents need them):
+      `request_cart_revision(reason: str)` and `cancel_checkout()`, both
+      `Command`-based. Neither does cross-agent routing itself — the
+      orchestrator's post-agent conditional edges do, confirmed below.
+      **Scoping decision made during implementation, not spelled out
+      here originally:** the Gift-Picker itself only gets `cancel_checkout`,
+      not `request_cart_revision` — the latter routes control TO the
+      Gift-Picker, so it doesn't make sense for the Gift-Picker to call it
+      on itself. Checkout Info and Confirm agents get both.
+
+### New shared stage: `with_gift_picker`
+- [x] Replaces `resolving_delivery_conflict`. Reached two ways: (1) the
+      normal `gift_request` path, once a cart is proposed and awaiting
+      approval, and (2) any hand-back from the Checkout Info or Confirm
+      agent. Same destination either way — one rule, not two.
+- [x] **Single exit condition — this is the actual fix for the auto-advance
+      complaint:** only `confirm_cart_and_proceed()` firing advances past
+      this stage (→ `checkout_info`). A `propose_cart` diff alone — even
+      the very first one — no longer auto-advances to checkout; it just
+      means "still in `with_gift_picker`, cart updated, waiting on
+      approval." **Verified live** end-to-end: proposing a cart alone left
+      `stage=with_gift_picker`/`checkout_info=None`; only the explicit
+      approval turn advanced to `checkout_info`.
+- [x] Detecting which of the three happened this turn
+      (`confirm_cart_and_proceed` fired / `propose_cart` fired / neither —
+      Gift-Picker just talked, e.g. answered a digression question) needs
+      a new field alongside the existing before/after `cart` diff —
+      `cart_confirmed: bool`, reset structurally before the node runs,
+      same pattern as `product_suggestions`.
+- [x] **Live finding, not in the original plan:** `_relay_gift_picker`'s
+      first implementation set `stage` to `with_gift_picker` only if
+      `stage` was already non-`None` going in — but a genuinely fresh
+      `gift_request` (stage never set yet) and a genuine `cancel_checkout`
+      (stage just cleared) both look identical under that check (`stage is
+      None` either way). Caught live: the very first `propose_cart` in a
+      brand-new conversation silently fell back to Intent Router
+      re-classification on the next turn instead of staying with the
+      Gift-Picker. Fixed by keying off whether `cart` currently exists
+      instead (a cart existing means "still with_gift_picker, awaiting
+      approval," matching this section's own framing above) — confirmed
+      live afterward that a first proposal correctly sets
+      `stage=with_gift_picker`.
+
+### `handoff_reason` replaces `_invoke_gift_picker_for_revision`
+- [x] New `ConciergeState` field, `handoff_reason: str | None`. Set by
+      `request_cart_revision(reason)`; read by `build_gift_picker_agent`
+      (formatted into its system prompt — "you're being consulted
+      mid-checkout because: {reason}") whenever it's non-null via a
+      `dynamic_prompt` middleware (`langchain.agents.middleware.dynamic_prompt`
+      — see the Gift-Picker's own module docstring for why this, not a
+      per-turn rebuild); cleared structurally after the `gift_picker` node
+      runs, same reset pattern as `product_suggestions`.
+- [x] **Routing stays in the parent graph, not inside the tool** — this is
+      the resolution to a risk flagged during the design discussion
+      (`Command(graph=Command.PARENT)` from inside a subgraph's tool,
+      untested in this codebase). It isn't needed: `request_cart_revision`
+      just writes `handoff_reason` via a plain `Command(update=...)`
+      exactly like `propose_cart` already does, and ends that agent's own
+      turn. A new conditional edge *after* the Checkout Info/Confirm agent
+      node (same shape as `_route_after_gift_picker`) checks whether
+      `handoff_reason` got set this turn and, if so, routes to
+      `with_gift_picker` — same turn, no extra customer message needed.
+- [x] **Live finding, correcting the plan's own "no synthetic
+      `[System note...]` message" line above:** one IS still needed, just
+      not for the reason Phase 3.5 needed it. Routing straight from one
+      embedded agent into the next within the same turn (this hand-back,
+      plus `with_gift_picker` -> `checkout_info` and `checkout_info` ->
+      `confirm`) leaves shared `messages` ending on the FIRST agent's own
+      final reply — a normal assistant turn its ReAct loop always produces
+      after a tool call — and Gemini refuses a request that doesn't end on
+      a user message or a function response (the exact bug this project
+      already found once for the Intent Router, resurfacing between two
+      real agents instead of a classifier and an agent). **Confirmed live**
+      the first time the Checkout Info Agent actually ran in the same turn
+      as the Gift-Picker's `confirm_cart_and_proceed` call. Fixed by having
+      each of the three same-turn transition nodes
+      (`_handoff_to_gift_picker`, `_enter_checkout_info`, `_enter_confirm`)
+      inject a synthetic `[System note — not from the customer: ...]`
+      `HumanMessage` before handing off — reusing Phase 3's own
+      `_invoke_gift_picker_for_revision` pattern, just at a different seam.
+      The deterministic gate's own fall-through to the Confirm Agent needs
+      no such note (it makes no agent/LLM call itself).
+
+### Checkout Info Agent (new, `src/checkout/checkout_info_agent.py`) — replaces the Delivery Agent concept from the first draft of this phase, now covers Gate 1/2/3
+- [x] Renamed from "Delivery Agent" — it now gathers everything
+      `kapruka_create_order` needs besides the cart itself (city, date,
+      recipient name/phone, delivery address, sender name), not just the
+      delivery leg, so "Delivery Agent" undersold it.
+- [x] Same class as the Gift-Picker — `create_agent`, real ReAct loop, no
+      structured-output/tools conflict since it needs the tool loop, not
+      classification. Embedded as a literal, always-on subgraph node, same
+      mechanism as the Gift-Picker (not a per-turn rebuild) — per-turn
+      context (cart, gathered-so-far, today's date) reaches its prompt via
+      `dynamic_prompt` middleware instead.
+- [x] Tools: `resolve_city(query)` (thin `@tool` wrapper around the
+      existing `delivery.py::resolve_city`, reused as-is underneath),
+      `check_delivery(city, date)` (thin wrapper around the existing
+      `check_delivery_for_cart`), `finalize_checkout_info(city, date,
+      recipient_name, recipient_phone, delivery_address, sender_name)`
+      (`Command`-based, writes all six fields into `checkout_info` in one
+      call — merging with whatever `check_delivery` already recorded
+      rather than overwriting it, not a full replace — ends this agent's
+      loop), plus the shared `request_cart_revision`/`cancel_checkout`
+      from above. Deliberately no cart-summary tool — cart questions
+      always go to Gift-Picker via `request_cart_revision`, not answered
+      inline. **Implementation deviation from the plan's own wording:**
+      cart/checkout_info are read via LangGraph's `InjectedState`, not
+      "`RunnableConfig`/closure the same way `get_recipient_profile` reads
+      `phone_number`" as originally written here — `RunnableConfig` only
+      carries session identity, not graph state, and a closure captured at
+      agent-build-time would go stale if `check_delivery` and
+      `finalize_checkout_info` both fire within the same ReAct loop
+      (`finalize_checkout_info` would merge against the PRE-loop
+      snapshot, silently dropping whatever `check_delivery` just wrote).
+      `InjectedState` reads live, current state at each tool's own
+      call time, avoiding that. **Second live finding on the same
+      mechanism:** `InjectedState("checkout_info")` raised a bare
+      `KeyError` the first time `check_delivery` ran on a brand-new
+      checkout (`checkout_info` genuinely never written yet) — LangGraph
+      only treats an injected-state parameter as optional (defaulting to
+      absent/`None` instead of raising) when the parameter itself carries
+      a Python default value, confirmed by reading
+      `ToolNode._inject_tool_args`'s source, not guessed. Fixed by adding
+      `= None` to every `InjectedState`-annotated parameter.
+- [x] **No lookup/autofill for the new fields — checked `schema.sql`
+      directly rather than assumed.** `recipients` only stores the
+      *customer's* own `phone_number`, `name`, `relationship`,
+      `preferences` — nothing about a recipient's phone number or a
+      delivery address. So `recipient_phone`/`delivery_address` are
+      accepted as plain free text, same posture as today's Gate 3 asks,
+      just gathered conversationally instead of one rigid prompt per
+      field. **Verified live**: a single reply ("It's for Kasun, phone
+      0771234567, address 45 Galle Road, Colombo 03. From Ashan.") was
+      captured correctly in one turn, not forced through Phase 3's
+      one-field-per-turn pattern.
+- [x] **Sequencing guidance, not a hard code gate:** the system prompt
+      steers the agent to settle city/date and run `check_delivery` before
+      asking for recipient/address/sender. **Verified live**: the agent
+      consistently asked for city/date first, ran `check_delivery`, then
+      asked for the remaining four fields in one combined message.
+- [x] Date resolution ("next thursday," "the 25th") is the agent's own
+      reasoning, not a regex — today's date is formatted into its system
+      prompt via the same `dynamic_prompt` mechanism (computed fresh via
+      `datetime.now().date()` at each call, not baked in at compile time).
+      Validated at least one day ahead before `check_delivery` accepts it
+      (moved the guard here rather than `finalize_checkout_info`, since
+      `check_delivery` is the first place a date string is actually used)
+      — adapted from `_invalid_date_reason`'s calendar-validity check
+      rather than reused verbatim (that function itself is retired).
+- [x] Never has `kapruka_create_order` — same tool-scoping exclusion as
+      the Gift-Picker.
+- [x] On a failed `check_delivery`: no separate revision node — the agent
+      just calls `request_cart_revision(reason)` directly, same tool as
+      any other cart-change need. Once Gift-Picker resolves it and the
+      customer approves again (`confirm_cart_and_proceed`), control
+      returns to `checkout_info` — `checkout_info` itself is never wiped
+      on re-entry (only `checkout_info_finalized` resets to `False`), so
+      previously-gathered fields carry forward and the agent's own prompt
+      guidance is what's relied on to re-validate city/date against the
+      (possibly changed) cart rather than a hard-coded re-check. Not
+      separately live-tested (a real undeliverable city/date combination
+      wasn't exercised) — same deliberate scope choice Phase 3 made for
+      the equivalent case, it shares the code path with what WAS tested.
+
+### Confirm Agent (new, `src/checkout/confirm_agent.py`) — replaces `awaiting_confirm`/`handle_awaiting_confirm`
+- [x] Stage renamed `confirm`. Opens every model call with the existing
+      `build_summary` output formatted into its system prompt via
+      `dynamic_prompt` (same mechanism as the Checkout Info Agent's
+      `cart_summary`) — no separate "show summary" tool needed.
+- [x] Tools: shared `request_cart_revision`/`cancel_checkout`, plus a new
+      `ask_final_confirmation()` (`Command`-based) — sets a new
+      `awaiting_final_yes: bool` state field and prompts the model to ask
+      a single forced-choice question ("place this order now? yes/no").
+      This is the seam between "fully agentic conversation" and "the one
+      deterministic gate."
+- [x] **The deterministic gate itself, unchanged in spirit from Phase 3:**
+      `_route_from_start` checks `stage == "confirm"` AND
+      `awaiting_final_yes` together — if both, run `is_confirmation` on
+      the raw reply directly, no agent call at all for this specific
+      check. Pass → `complete_order` (same single call site as before,
+      still outside any agent). Fail → clear `awaiting_final_yes`, route
+      into the Confirm Agent to actually figure out what the customer
+      meant — it can re-ask and re-set the flag once it's actually ready
+      to. `stage == "confirm"` with `awaiting_final_yes` false or unset →
+      straight into the Confirm Agent, same as any other turn.
+      **Verified live**: a non-yes reply ("hmm, actually let me think
+      about it") while the gate was armed did NOT trigger `create_order`
+      and correctly fell through to the Confirm Agent, which then
+      re-engaged naturally (and re-armed the gate on its own initiative
+      when it judged the customer was ready again — the agent's own
+      judgment call, not a code path).
+- [x] Confirm Agent never has `kapruka_create_order` as a tool — stays
+      outside every agent, verifiable by inspection, exactly the property
+      Phase 3 built this hard rule around.
+- [x] **Live finding, not anticipated in the plan:** `dynamic_prompt`
+      re-runs on every model call within the agent's OWN ReAct loop, not
+      just its first. If `cancel_checkout` fires mid-loop (clearing
+      `checkout_info`) and the loop then makes one more call to generate
+      its own "okay, cancelled!" reply, the prompt callback was calling
+      `build_summary` against an already-empty `checkout_info` and
+      crashing with a bare `KeyError` — caught live on exactly that
+      sequence. Fixed by checking all six required fields are still
+      present before calling `build_summary`, falling back to a
+      placeholder summary text otherwise; `build_summary` itself untouched.
+
+### `cancel_checkout()` — shared tool, no longer a router-classified intent
+- [x] Same clearing behavior as the old `cancel_checkout_node`
+      (`stage`/`cart`/`checkout_info`/`handoff_reason` all cleared) — now
+      triggered by whichever agent (Gift-Picker, Checkout Info, or
+      Confirm) recognizes the customer wants out, rather than reached via
+      a classifier edge. Terminal — no hand-off needed; unlike the old
+      router-reached node, the reply text is now the calling agent's OWN
+      generated acknowledgement (a `ToolMessage` result the agent reacts
+      to), not a fixed canned string — **verified live**, a real "actually,
+      cancel this whole order" produced a natural "I have canceled your
+      order..." reply and a fully cleared state (`stage: None`, empty
+      cart, `checkout_info: None`).
+
+### `_route_from_start`, final shape
+- [x] `stage` absent → Intent Router (unchanged).
+      `stage == "with_gift_picker"` → `gift_picker` node directly.
+      `stage == "checkout_info"` → Checkout Info Agent directly.
+      `stage == "confirm"` → the `awaiting_final_yes` check above, then
+      either the deterministic gate or the Confirm Agent.
+      No classify-then-dispatch hop anywhere in checkout, and no separate
+      Gate-3 stage either — every stage routes straight to the agent (or,
+      for the one exception, the plain check) that owns it.
+
+### Verification checklist — all verified live 2026-09-23, real Gemini + Kapruka MCP + Neon, no `create_order` ever fired
+- [x] `confirm_cart_and_proceed` vs. a `propose_cart` diff are correctly
+      distinguished on the same turn they could both plausibly fire —
+      confirmed across the full live run below (propose-only turns never
+      advanced the stage; the explicit-approval turn always did).
+- [x] A bare ISO date resolves correctly against an injected today's-date
+      ("2026-10-20" against a live "today" of September 23, 2026, correctly
+      treated as future and accepted). "Next thursday"/"the 25th"-style
+      relative dates and a same-day/past-date rejection were not
+      separately exercised in this run — worth a follow-up test, not
+      blocking, since the guard logic (`_invalid_delivery_date_reason`) is
+      a straightforward adaptation of Phase 3's own already-tested
+      calendar-validity check.
+- [x] A conversational reply that volunteers more than one field at once
+      ("It's for Kasun, phone 0771234567, address 45 Galle Road, Colombo
+      03. From Ashan.") was captured correctly in one turn — confirmed
+      live, not forced through one-field-per-turn the way Gate 3 used to
+      work.
+- [x] A `check_delivery` failure correctly reaching Gift-Picker via
+      `request_cart_revision` was NOT separately exercised live in this
+      run (no real undeliverable city/date was hit) — same deliberate
+      scope choice Phase 3 made for the equivalent case: it shares 100% of
+      the code path with a `request_cart_revision` hand-back that WAS
+      tested live (the mid-`checkout_info` digression below).
+- [x] The `awaiting_final_yes` deterministic gate: a genuine "yes" was
+      deliberately never sent (same "never fire a real create_order during
+      dev" boundary as every other checkout test in this codebase, plus a
+      direct unit check of `is_confirmation` on representative strings). A
+      non-yes reply on an armed turn correctly did NOT trigger
+      `complete_order` and correctly fell through to the Confirm Agent —
+      verified live.
+- [x] `cancel_checkout()` correctly clears state and produces a clean
+      cancellation reply when called from the Gift-Picker mid-`with_gift_picker`
+      digression path (a real "wait, can I add chocolates?" correctly
+      routed there rather than being swallowed) and from the Confirm
+      Agent (verified live, see above). Not separately exercised from the
+      Checkout Info Agent in this run — same shared tool, same mechanism,
+      lower-risk gap than the others.
+
+### Full live run, 2026-09-23 (`local-mcp-tool-test/test_phase36_e2e.py`, not committed)
+Search → propose → explicit approve (`checkout_info`) → mid-`checkout_info`
+digression ("can I add chocolates too?") correctly handed back to the
+Gift-Picker (`with_gift_picker`) instead of being swallowed as a literal
+field answer → re-approve → city/date → `check_delivery` passed live
+(Colombo 03, LKR 300) → all four remaining fields in one reply →
+`finalize_checkout_info` fired, advanced to `confirm` same turn, full
+order summary shown, `awaiting_final_yes` armed → a mid-`confirm` question
+("what's the total?") answered directly without losing state → a non-yes
+reply while armed correctly did not check out and fell through to the
+Confirm Agent → an explicit cancel correctly cleared everything. Zero
+`create_order` calls made. Two real bugs were found and fixed live during
+this same run (the `_relay_gift_picker` cart-existence fix and the
+Confirm Agent `dynamic_prompt` cancellation-mid-loop fix, both detailed in
+their respective sections above) — the run that finally succeeded
+end-to-end is the one summarized here.
 
 ## Phase 4 — Track-order branch
 

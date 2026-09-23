@@ -2,7 +2,7 @@
 tools — search_products/get_product/list_categories — wired in agent.py).
 """
 
-from typing import Annotated, Optional
+from typing import Annotated
 
 from langchain_core.messages import ToolMessage
 from langchain_core.runnables import RunnableConfig
@@ -81,33 +81,33 @@ def propose_cart(
     estimated_total: float,
     tool_call_id: Annotated[str, InjectedToolCallId],
     notes: str = "",
-    delivery_city: Optional[str] = None,
-    delivery_date: Optional[str] = None,
 ) -> Command:
-    """Finalize the gift as a concrete cart, ready for checkout.
-
-    Call this ONLY once you and the customer have converged on specific
-    items — not to tentatively summarize progress, and not just because a
-    turn is ending. If you're still narrowing down options, use
-    suggest_products and ask a follow-up instead. Calling this ends your
-    turn: don't call it and then keep negotiating in the same reply.
+    """Propose (or revise) the gift as a concrete cart, for the customer to
+    react to — NOT the same as the customer approving it. Call this once
+    you and the customer have converged on specific items, whether that's
+    the first proposal or a change to one already on the table. If you're
+    still narrowing down options, use suggest_products and ask a follow-up
+    instead.
 
     Each item dict must use the key `product_id` (NOT `id` — see
     suggest_products for the exact-case, no-retyping rule), plus a plain
     `price` number (never a nested price object) and whatever name info you
     have.
 
-    Pass delivery_city/delivery_date only if the customer has already
-    stated them in this conversation — never guess, and never ask for them
-    just to fill in this call; a later step collects whatever's still
-    missing.
+    Cart-only — no delivery_city/delivery_date here. Delivery details are
+    gathered later, once the customer has actually approved this cart
+    (confirm_cart_and_proceed), by a dedicated step that also validates
+    deliverability.
+
+    Calling this ends your turn — don't call it and then keep negotiating
+    in the same reply. If the customer has ALREADY approved what's here
+    with nothing further to change, call confirm_cart_and_proceed instead
+    of re-proposing the same cart.
     """
     cart: Cart = {
         "items": items,
         "estimated_total": estimated_total,
         "notes": notes,
-        "delivery_city": delivery_city,
-        "delivery_date": delivery_date,
     }
     return Command(
         update={
@@ -115,6 +115,32 @@ def propose_cart(
             "product_suggestions": [],
             "messages": [
                 ToolMessage(f"Cart proposed: {cart}", tool_call_id=tool_call_id)
+            ],
+        }
+    )
+
+
+@tool
+def confirm_cart_and_proceed(tool_call_id: Annotated[str, InjectedToolCallId]) -> Command:
+    """Call when the customer approves the CURRENT cart with nothing
+    further to change — the cart already on the table is what they want,
+    and they're ready to move on to delivery/checkout details.
+
+    Distinct from propose_cart: propose_cart is "here's a cart" (new or
+    changed, still open to further changes); this is "yes, that one,
+    let's proceed" (a judgment call about the customer's LATEST reply, not
+    a restatement of the cart itself — don't pass any arguments, don't
+    re-describe the cart, just call this).
+
+    Do NOT call this just because a turn is ending, or to tentatively
+    move things along — only when the customer's own words clearly
+    approve what's already proposed with nothing left to negotiate.
+    """
+    return Command(
+        update={
+            "cart_confirmed": True,
+            "messages": [
+                ToolMessage("Cart confirmed by the customer; proceeding to checkout.", tool_call_id=tool_call_id)
             ],
         }
     )

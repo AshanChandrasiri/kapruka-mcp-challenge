@@ -25,10 +25,26 @@ class Cart(TypedDict):
     items: list[dict]
     estimated_total: float
     notes: str
-    delivery_city: Optional[str]
-    delivery_date: Optional[str]
 
 
 class GiftPickerState(AgentState):
     product_suggestions: NotRequired[list[ProductSuggestion]]
     cart: NotRequired[Optional[Cart]]
+    # Phase 3.6: set by confirm_cart_and_proceed (the customer approved the
+    # CURRENT cart, not just proposed one) — the orchestrator's own
+    # cart-diff detection can't tell "new cart" from "approved cart" apart
+    # on its own, so this is a second, explicit signal.
+    cart_confirmed: NotRequired[bool]
+    # Phase 3.6: non-null while the Gift-Picker is being consulted
+    # mid-checkout (set by request_cart_revision, a tool shared with the
+    # Checkout Info/Confirm agents) — read by build_gift_picker_agent's
+    # dynamic system prompt, cleared by the orchestrator after this node
+    # runs. Absent/None on a fresh gift_request.
+    handoff_reason: NotRequired[Optional[str]]
+    # Declared here (not just used) so the shared cancel_checkout tool's
+    # Command update reaches the PARENT ConciergeState when the Gift-Picker
+    # itself calls it — a child subgraph node only projects channels its
+    # own state schema declares; without these two, clearing them here
+    # would silently no-op instead of clearing the parent's copy.
+    stage: NotRequired[Optional[str]]
+    checkout_info: NotRequired[Optional[dict]]

@@ -1,13 +1,13 @@
-"""ConciergeOrchestrator — the root graph. Dispatches on the Intent
-Router's result.
+"""ConciergeOrchestrator — the root graph. Dispatches on the active
+classifier/agent's result.
 
 Not a purely sequential graph — every node in a fixed sequence would run
 unconditionally, with no way to skip based on the classification result.
 Not the supervisor/conditional-edge-by-agent-reasoning pattern either — that
-pattern's routing decision comes from an agent node's own reasoning; this
-dispatches on a plain string the router already returned. A custom
-StateGraph is LangGraph's graph-based pattern for exactly this shape of
-conditional routing.
+pattern's routing decision comes from an agent node's own reasoning; the
+Intent Router branch below dispatches on a plain string the router already
+returned. A custom StateGraph is LangGraph's graph-based pattern for
+exactly this shape of conditional routing.
 
 The Intent Router reads this graph's own `messages` state directly — not a
 second compiled-graph invocation with its own message list, which would
@@ -34,106 +34,118 @@ even reach it. The router's own bounded path lives only in
 `classify_intent()`'s standalone call (src/router/intent_router.py), used
 for isolated testing.
 
-The Gift-Picker is embedded the same way as the router — a real subgraph
-node sharing `messages`/`product_suggestions`/`cart` with this graph (see
-src/gift_picker/state.py for why matching field names is what makes that
-automatic). Detecting "did propose_cart fire THIS turn" (not a stale cart
-from an earlier turn) is done by snapshotting `cart` immediately before the
-Gift-Picker runs and comparing it against `cart` immediately after — a
-change means propose_cart ran this turn. An EphemeralValue signal (as used
-for the router's structured_response below) doesn't work for this: it only
-survives exactly one step past the write, but the Gift-Picker's own ReAct
-loop always needs one more internal step after a tool call (the model's
-reply acknowledging the tool result) before the subgraph itself returns —
-so an ephemeral flag set inside that subgraph would already be cleared by
-the time control returns to this parent graph. A plain before/after value
-comparison across the two real parent-level steps (reset -> Gift-Picker)
-has no such timing gap.
+The Gift-Picker, Checkout Info Agent, and Confirm Agent are all embedded
+the same way — real subgraph nodes sharing `messages` plus whichever
+custom fields their own state schema declares (see
+src/gift_picker/state.py, src/checkout/checkout_info_agent.py,
+src/checkout/confirm_agent.py for why matching field names is what makes
+that automatic). Each is a literal, always-on node built once at compile
+time; per-turn context (a mid-checkout handoff reason, the current cart,
+today's date, the order summary) reaches their prompts via `dynamic_prompt`
+middleware (re-evaluated at actual model-call time, inside each agent's own
+ReAct loop) rather than by rebuilding the node fresh every turn, and reaches
+their tools that need live cart/checkout_info via LangGraph's
+`InjectedState` rather than asking the model to retype it as an argument.
 
-Phase 3 (checkout) adds a stage pre-check ahead of everything above:
-`_route_from_start` reads `stage` before the Intent Router ever runs. A
-`collecting_delivery`/`awaiting_confirm`/`resolving_delivery_conflict` stage
-means a checkout is already in progress, and the customer's reply belongs
-to that flow, not a fresh classification — see src/checkout/flow.py for the
-state machine itself. `resolving_delivery_conflict` re-enters through the
-same `reset_before_gift_picker -> gift_picker -> _route_after_gift_picker`
-chain as a fresh `gift_request` — deliberately reused, since "the Gift-Picker
-needs another turn" is the same move either way. The only difference is
-where the cart-changed branch goes now: `start_checkout_node`
-(src/checkout/flow.py) replaces what was a Phase 2 stub.
+Phase 3.6 replaced Phase 3's deterministic one-field-per-turn machinery and
+Phase 3.5's Checkout Router classifier entirely — retired, not extended:
+`src/router/checkout_router.py`, `_run_checkout_router`,
+`_route_on_checkout_intent`, `handle_checkout_digression`,
+`_invoke_gift_picker_for_revision`, `_hand_back_to_gift_picker`, the
+`collecting_delivery`/`resolving_delivery_conflict`/`awaiting_confirm`
+stage names, `_advance_checkout`, `handle_collecting_delivery`, `_ask`,
+`FIELD_PROMPTS`, `_invalid_date_reason` are all gone. In their place: three
+agents that own their own judgment (see src/gift_picker/agent.py's own
+module docstring for why the Gift-Picker's embedding mechanism itself
+didn't need to change), plus exactly one thing that's still deterministic —
+see the hard-rule section below.
 
-Phase 3.5 replaces the direct `stage` -> handler bypass with an LLM
-classification step: `_route_from_start` now sends every checkout stage
-(`collecting_delivery`/`awaiting_confirm`/`resolving_delivery_conflict`) to
-`checkout_router` (a second, narrower classifier, src/router/checkout_router.py)
-first — no stage still bypasses classification entirely, every turn goes
-through one classifier or the other. Problem this fixes: a free-form
-digression during `collecting_delivery` (e.g. "actually change the order")
-used to be consumed as a literal field value, since that handler had no way
-to tell "this is an answer" from "this is not an answer" — **confirmed
-live**: a "what payment methods do you accept" tangent sent mid-
-`collecting_delivery` used to land in `checkout_info[collecting_field]`
-verbatim; a real cancel request sent during `resolving_delivery_conflict`
-(before this fix routed that stage through the classifier too) got handed
-straight to the Gift-Picker, which "cancelled" by emptying the cart via
-`propose_cart` instead of a clean state clear — messier than the dedicated
-`cancel_checkout` path below. `_run_checkout_router` follows the same
-embedding pattern as `_run_intent_router` (fresh agent instance, full
-`messages` history as input, only the classification fields returned) for
-the same reason `_run_intent_router` does it: avoid polluting shared
-`messages` with the classifier's own turn. **Widened after initial
-implementation:** originally only `messages[-1]` was passed in (the
-explicit `stage`/`collecting_field`/`cart_summary` snapshot was meant to be
-sufficient on its own), but that throws away the same working-memory value
-full history gives the Gift-Picker — e.g. a customer's phrasing earlier in
-the conversation that disambiguates a short, otherwise-ambiguous reply.
-Safe to widen for the same reason it was safe for the Intent Router: this
-node never merges the classifier's own generated turn back into shared
-`messages` (only `checkout_intent`/`extracted_value` are returned), so
-`state["messages"]` going in still always ends on a real customer turn —
-the exact invariant that mattered when this bug was first found on the
-Intent Router (see above). Unlike the Intent Router's `structured_response`,
-the Checkout Router's output fields (`checkout_intent`, `extracted_value`)
-are plain strings — no EphemeralValue/msgpack workaround needed, since
-there's no custom pydantic type being handed to the checkpointer.
+**Stages, final shape:** `with_gift_picker` (picking/revising a cart,
+including any hand-back from the other two agents — one destination
+either way, not two, as Phase 3.5's `resolving_delivery_conflict` used to
+be a separate name for the same thing) | `checkout_info` (gathering
+everything `kapruka_create_order` needs besides the cart) | `confirm`
+(order summary shown, working toward a final yes/no) | absent (normal
+flow, Intent Router runs).
 
-`_route_on_checkout_intent` dispatches: `cancel_checkout` (any stage) to a
-new terminal node that clears checkout state; at `resolving_delivery_conflict`,
-everything else (there's no single field pending at that stage regardless
-of classification — it's inherently a Gift-Picker mid-revision
-conversation) goes straight back to the Gift-Picker exactly as it did
-before this phase; otherwise `answers_pending` goes to whichever handler
-matches the stage, and `modify_request`/`unrelated` go to
-`handle_checkout_digression` (src/checkout/flow.py), which reuses the exact
-same Gift-Picker hand-back mechanism Phase 3 built for a failed delivery
-check and an unclear confirm reply. Hard rule, unchanged: `answers_pending`
-at `awaiting_confirm` is a routing decision, not a confirmation —
-`_is_confirmation` still independently gates `create_order` on the raw
-message text every time, not on `extracted_value`.
+**Single exit condition per stage — this is what actually fixes Phase
+3.5's auto-advance complaint:** a `propose_cart` diff alone, even the very
+first one, no longer auto-advances anywhere; only `confirm_cart_and_proceed`
+firing (`cart_confirmed`) advances `with_gift_picker` -> `checkout_info`,
+and only `finalize_checkout_info` firing (`checkout_info_finalized`)
+advances `checkout_info` -> `confirm`. Both flags are reset structurally
+right before the node that can set them runs (same pattern Phase 1/2 used
+for `product_suggestions`), so re-entering a stage never trusts a stale
+flag left over from earlier in the conversation.
+
+**`handoff_reason` replaces `_invoke_gift_picker_for_revision`:** set by
+the shared `request_cart_revision` tool (Checkout Info or Confirm agent,
+`src/checkout/shared_tools.py`), read by the Gift-Picker's own
+`dynamic_prompt` middleware, cleared structurally right after the
+Gift-Picker node runs regardless of outcome. Routing itself stays here in
+the parent graph, not inside the tool: a `Command(graph=Command.PARENT)`
+call from inside a subgraph's tool was considered and rejected as untested
+in this codebase; a conditional edge checking `handoff_reason` after each
+checkout-agent node runs (the `_route_after_*` functions below) reuses the
+exact plain-`Command(update=...)` mechanism `propose_cart` already proves
+works, just watched from one level up.
+
+**Found live, a second instance of the exact bug this module already
+documents for the Intent Router:** routing straight from one embedded
+agent's conditional edge into the NEXT embedded agent within the same turn
+(`enter_checkout_info`, `enter_confirm`, `_handoff_to_gift_picker`) leaves
+shared `messages` ending on the FIRST agent's own final reply — a normal
+assistant turn, since its ReAct loop always produces one after a tool call
+— and Gemini refuses a request that doesn't end on a user message or a
+function response. This didn't show up until two real agents actually
+chained within one turn, live. Fixed the same way Phase 3's
+`_invoke_gift_picker_for_revision` already fixed an analogous case: each of
+these three transition nodes injects a synthetic
+`[System note — not from the customer: ...]` `HumanMessage` before handing
+off, giving the next agent's model call a proper user turn to end on.
+`_check_final_confirmation` -> `confirm_agent` needs no such note — it
+makes no agent/LLM call itself, so `messages` still ends on the customer's
+own real reply when `confirm_agent` picks it up.
+
+**`cancel_checkout` is a shared tool now, not a router-reached node** — any
+of the three agents can recognize "the customer wants out" and call it
+directly; it clears `stage` to `None`, which every `_route_after_*`
+function below treats as "done, nothing further to route this turn."
+
+**The hard rule, unchanged in spirit since Phase 3 — this is the ONLY
+deterministic gate left in the whole checkout pipeline:** `_route_from_start`
+checks `stage == "confirm"` and `awaiting_final_yes` together. If both,
+`_check_final_confirmation` runs `is_confirmation` (src/checkout/flow.py)
+directly on the customer's raw reply — no agent call, no LLM judgment
+involved in this specific check. Pass -> `complete_order` (the only call
+site `kapruka_create_order` has anywhere in this codebase, reachable only
+from here). Fail -> clear `awaiting_final_yes` and fall through to the
+Confirm Agent, same turn, to actually figure out what the customer meant.
+The Confirm Agent's own `ask_final_confirmation` tool only ARMS this gate
+(sets `awaiting_final_yes`); it never itself decides the outcome, and it
+never has `kapruka_create_order` as a tool — verifiable by inspection,
+exactly the property Phase 3 built this hard rule around in the first
+place.
 """
 
 from typing import Annotated, Literal, Optional, TypedDict
 
-from langchain_core.messages import AIMessage, AnyMessage
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
+from langchain_core.runnables import RunnableConfig
 from langgraph.channels.ephemeral_value import EphemeralValue
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
-from src.checkout.flow import (
-    cancel_checkout_node,
-    handle_awaiting_confirm,
-    handle_checkout_digression,
-    handle_collecting_delivery,
-    start_checkout_node,
-)
+from src.checkout.checkout_info_agent import build_checkout_info_agent
+from src.checkout.confirm_agent import build_confirm_agent
+from src.checkout.flow import complete_order, is_confirmation
 from src.gift_picker.agent import build_gift_picker_agent
 from src.gift_picker.state import Cart, ProductSuggestion
 from src.prompts import CHITCHAT_RESPONSE, OUT_OF_SCOPE_RESPONSE
-from src.router.checkout_router import CheckoutIntent, build_checkout_router_agent
 from src.router.intent_router import Intent, IntentClassification, build_router_agent
 from src.session import get_checkpointer
 
-Stage = Literal["collecting_delivery", "resolving_delivery_conflict", "awaiting_confirm"]
+Stage = Literal["with_gift_picker", "checkout_info", "confirm"]
 
 
 class ConciergeState(TypedDict, total=False):
@@ -150,79 +162,39 @@ class ConciergeState(TypedDict, total=False):
     # _route_after_gift_picker can tell a fresh propose_cart call apart from
     # a cart left over from an earlier turn.
     cart_snapshot: Optional[Cart]
-    # Checkout state machine (src/checkout/flow.py) — absent means no
-    # checkout in progress.
+    # Checkout state machine — absent means no checkout in progress.
     stage: Optional[Stage]
     checkout_info: Optional[dict]
-    collecting_field: Optional[str]
-    # Checkout Router's classification this turn (Phase 3.5) — only ever
-    # set on a turn that actually ran checkout_router; plain strings, so
-    # (unlike the Intent Router's structured_response) no EphemeralValue
-    # workaround is needed to keep them checkpoint-safe.
-    checkout_intent: Optional[CheckoutIntent]
-    extracted_value: Optional[str]
+    # Set by confirm_cart_and_proceed; reset False before every Gift-Picker
+    # run. Absent this reset, an earlier turn's confirmation would look
+    # live forever.
+    cart_confirmed: Optional[bool]
+    # Set by finalize_checkout_info; reset False before every Checkout Info
+    # Agent run, same reasoning as cart_confirmed — a checkout_info dict
+    # that already has all six fields from BEFORE a revision would
+    # otherwise look finalized again without the agent re-validating it.
+    checkout_info_finalized: Optional[bool]
+    # Non-null while a checkout agent is consulting the Gift-Picker
+    # mid-checkout (request_cart_revision); read by the Gift-Picker's own
+    # dynamic prompt, cleared right after it runs.
+    handoff_reason: Optional[str]
+    # Set by ask_final_confirmation; checked by _route_from_start together
+    # with is_confirmation on the customer's NEXT raw reply — the one
+    # deterministic gate in the whole pipeline.
+    awaiting_final_yes: Optional[bool]
 
 
-def  _route_from_start(state: ConciergeState) -> str:
+def _route_from_start(state: ConciergeState) -> str:
     stage = state.get("stage")
-    if stage in ("collecting_delivery", "awaiting_confirm", "resolving_delivery_conflict"):
-        return "checkout_router"
+    if stage == "with_gift_picker":
+        return "gift_picker"
+    if stage == "checkout_info":
+        return "checkout_info_agent"
+    if stage == "confirm":
+        if state.get("awaiting_final_yes"):
+            return "check_final_confirmation"
+        return "confirm_agent"
     return "intent_router"
-
-
-def _summarize_checkout_for_router(state: ConciergeState) -> str:
-    """Short, human-readable snapshot of the in-progress checkout for the
-    Checkout Router's prompt — deliberately not the raw cart/checkout_info
-    dicts (delivery_checked_cart etc. are orchestrator bookkeeping the
-    classifier has no use for).
-    """
-    cart = state.get("cart") or {}
-    items = ", ".join(
-        item.get("name", item.get("product_id", "?")) for item in cart.get("items", [])
-    ) or "(no items)"
-    checkout_info = state.get("checkout_info") or {}
-    collected = {
-        key: value
-        for key, value in checkout_info.items()
-        if value and not key.startswith("_") and key not in (
-            "delivery_checked", "delivery_checked_cart", "delivery_fee", "perishable_warnings",
-        )
-    }
-    return f"items=[{items}], estimated_total={cart.get('estimated_total')}, collected_so_far={collected}"
-
-
-async def _run_checkout_router(state: ConciergeState) -> dict:
-    cart_summary = _summarize_checkout_for_router(state)
-    router = build_checkout_router_agent(state["stage"], state.get("collecting_field"), cart_summary)
-    # Full history, not just the latest message — same working-memory value
-    # it gives the Gift-Picker. Safe here for the same reason it's safe for
-    # _run_intent_router: this node never merges its own generated turn
-    # back into shared `messages`, only the classification fields below.
-    result = await router.ainvoke({"messages": state["messages"]})
-    classification = result["structured_response"]
-    return {"checkout_intent": classification.intent, "extracted_value": classification.extracted_value}
-
-
-def _route_on_checkout_intent(state: ConciergeState) -> str:
-    intent = state["checkout_intent"]
-    stage = state["stage"]
-    print(f'_route_on_checkout_intent --> {intent}')
-    print(f'_route_on_checkout_intent, stage --> {stage}')
-
-    if intent == "cancel_checkout":
-        return "cancel_checkout_node"
-
-    if stage == "resolving_delivery_conflict":
-        # No single field is pending at this stage regardless of
-        # classification (that's inherently a Gift-Picker mid-revision
-        # conversation, not a structured field answer) — everything short
-        # of an explicit cancel goes straight back to it, same as before
-        # Phase 3.5 added this classifier.
-        return "reset_before_gift_picker"
-
-    if intent == "answers_pending":
-        return "handle_awaiting_confirm" if stage == "awaiting_confirm" else "handle_collecting_delivery"
-    return "handle_checkout_digression"
 
 
 async def _run_intent_router(state: ConciergeState) -> dict:
@@ -255,22 +227,157 @@ def _out_of_scope_node(state: ConciergeState) -> dict:
 
 
 def _reset_before_gift_picker(state: ConciergeState) -> dict:
-    """Structural reset, not left to the model to remember: product_suggestions
-    is stale from any earlier turn by the time we get here, and cart_snapshot
+    """Structural reset, not left to the model to remember — reused for
+    every entry into the Gift-Picker, whether a fresh gift_request or a
+    mid-checkout hand-back: product_suggestions/cart_confirmed are stale
+    from any earlier turn by the time we get here, and cart_snapshot
     captures the pre-turn cart for _route_after_gift_picker's diff below.
     """
-    return {"product_suggestions": [], "cart_snapshot": state.get("cart")}
+    return {
+        "product_suggestions": [],
+        "cart_snapshot": state.get("cart"),
+        "cart_confirmed": False,
+    }
+
+
+def _handoff_to_gift_picker(state: ConciergeState) -> dict:
+    """Entry into the Gift-Picker from a MID-CHECKOUT hand-back
+    (request_cart_revision, from the Checkout Info or Confirm agent), same
+    turn as whichever agent called it — distinct from _reset_before_gift_picker,
+    which handles the fresh-gift_request entry (from Intent Router) and
+    does NOT need what this does.
+
+    A synthetic system-note HumanMessage is required here, not optional:
+    the calling agent's own final reply already closed out THIS turn's
+    shared `messages` on an assistant turn (its normal ReAct-loop reply
+    after calling request_cart_revision), and Gemini refuses a request
+    that doesn't end on a user message or a function response — the exact
+    bug already documented and fixed once for the Intent Router (see this
+    module's own docstring), now surfacing between two real conversational
+    agents chained in the same turn instead of a classifier and an agent.
+    **Found live, the same way the original bug was:** this class of issue
+    only shows up once two real model calls actually chain within one
+    turn, so it wasn't visible until the Checkout Info Agent was live-tested.
+    """
+    reason = state.get("handoff_reason") or "the customer needs something changed."
+    note = HumanMessage(content=f"[System note — not from the customer: {reason}]")
+    return {
+        "messages": [note],
+        "product_suggestions": [],
+        "cart_snapshot": state.get("cart"),
+        "cart_confirmed": False,
+    }
 
 
 def _route_after_gift_picker(state: ConciergeState) -> str:
-    if state.get("cart") != state.get("cart_snapshot"):
-        return "start_checkout"
-    return "no_cart_relay"
+    if state.get("cart_confirmed"):
+        return "enter_checkout_info"
+    return "relay_gift_picker"
 
 
-def _no_cart_relay(state: ConciergeState) -> dict:
+def _relay_gift_picker(state: ConciergeState) -> dict:
+    """Sets stage by whether a cart currently exists, NOT by whether stage
+    was already set going in — this node is reachable both from a fresh
+    gift_request (stage never set) and from an already-active
+    with_gift_picker/hand-back turn, and those two cases can't be told
+    apart by "was stage None before" the way every other checkout agent's
+    relay can (they're never entered from a stage-absent start). A cart
+    existing means "still with_gift_picker, cart proposed but not yet
+    approved" — matching the plan's own framing ("reached once a cart is
+    proposed and awaiting approval"), including the very first proposal in
+    a conversation, not just a revision. No cart (including right after
+    cancel_checkout, which clears it) means back to plain Intent Router
+    classification next turn, exactly like Phase 1-3.5's pre-cart phase
+    always worked.
+    """
     print("[console] product_suggestions:", state.get("product_suggestions"))
-    return {}
+    return {
+        "handoff_reason": None,
+        "stage": "with_gift_picker" if state.get("cart") is not None else None,
+    }
+
+
+def _enter_checkout_info(state: ConciergeState) -> dict:
+    """Same-turn transition from the Gift-Picker (cart just confirmed).
+    Needs the same synthetic-note treatment _handoff_to_gift_picker uses,
+    for the identical reason: the Gift-Picker's own final reply already
+    closed this turn's shared `messages` on an assistant turn, and the
+    Checkout Info Agent's own model call needs it to end on a user turn.
+    """
+    note = HumanMessage(
+        content="[System note — not from the customer: the customer just approved this "
+        "cart. Gather delivery city/date, recipient name/phone, delivery address, and "
+        "sender name.]"
+    )
+    return {
+        "messages": [note],
+        "stage": "checkout_info",
+        "handoff_reason": None,
+        "checkout_info_finalized": False,
+    }
+
+
+def _route_after_checkout_info(state: ConciergeState) -> str:
+    if state.get("stage") is None:
+        return "relay_checkout_info"
+    if state.get("handoff_reason"):
+        return "handoff_to_gift_picker"
+    if state.get("checkout_info_finalized"):
+        return "enter_confirm"
+    return "relay_checkout_info"
+
+
+def _relay_checkout_info(state: ConciergeState) -> dict:
+    update: dict = {}
+    if state.get("stage") is not None:
+        update["stage"] = "checkout_info"
+    return update
+
+
+def _enter_confirm(state: ConciergeState) -> dict:
+    """Same-turn transition from the Checkout Info Agent (info just
+    finalized) — same synthetic-note reasoning as _enter_checkout_info.
+    """
+    note = HumanMessage(
+        content="[System note — not from the customer: checkout info is gathered. Show "
+        "the order summary and work toward a final yes/no on placing the order.]"
+    )
+    return {"messages": [note], "stage": "confirm", "awaiting_final_yes": False}
+
+
+def _route_after_confirm(state: ConciergeState) -> str:
+    if state.get("stage") is None:
+        return "relay_confirm"
+    if state.get("handoff_reason"):
+        return "handoff_to_gift_picker"
+    return "relay_confirm"
+
+
+def _relay_confirm(state: ConciergeState) -> dict:
+    update: dict = {}
+    if state.get("stage") is not None:
+        update["stage"] = "confirm"
+    return update
+
+
+async def _check_final_confirmation(state: ConciergeState, config: RunnableConfig) -> dict:
+    """The hard-rule gate itself — see this module's own docstring. No
+    agent/LLM call anywhere in this function.
+    """
+    reply = state["messages"][-1].text.strip()
+    if not is_confirmation(reply):
+        return {"awaiting_final_yes": False}
+    phone_number = config["configurable"]["thread_id"]
+    return await complete_order(state["cart"], state["checkout_info"], phone_number)
+
+
+def _route_after_final_confirmation_check(state: ConciergeState) -> str:
+    if state.get("stage") is None:
+        # complete_order ran and cleared everything.
+        return END
+    # Not a clear yes — awaiting_final_yes already cleared; let the Confirm
+    # Agent actually engage with whatever the customer said, same turn.
+    return "confirm_agent"
 
 
 def _track_order_stub(state: ConciergeState) -> dict:
@@ -306,14 +413,16 @@ async def build_orchestrator():
     graph.add_node("chitchat_node", _chitchat_node)
     graph.add_node("out_of_scope_node", _out_of_scope_node)
     graph.add_node("reset_before_gift_picker", _reset_before_gift_picker)
+    graph.add_node("handoff_to_gift_picker", _handoff_to_gift_picker)
     graph.add_node("gift_picker", await build_gift_picker_agent())
-    graph.add_node("start_checkout", start_checkout_node)
-    graph.add_node("checkout_router", _run_checkout_router)
-    graph.add_node("handle_collecting_delivery", handle_collecting_delivery)
-    graph.add_node("handle_awaiting_confirm", handle_awaiting_confirm)
-    graph.add_node("handle_checkout_digression", handle_checkout_digression)
-    graph.add_node("cancel_checkout_node", cancel_checkout_node)
-    graph.add_node("no_cart_relay", _no_cart_relay)
+    graph.add_node("relay_gift_picker", _relay_gift_picker)
+    graph.add_node("enter_checkout_info", _enter_checkout_info)
+    graph.add_node("checkout_info_agent", await build_checkout_info_agent())
+    graph.add_node("relay_checkout_info", _relay_checkout_info)
+    graph.add_node("enter_confirm", _enter_confirm)
+    graph.add_node("confirm_agent", await build_confirm_agent())
+    graph.add_node("relay_confirm", _relay_confirm)
+    graph.add_node("check_final_confirmation", _check_final_confirmation)
     graph.add_node("track_order_stub", _track_order_stub)
     graph.add_node("return_item_stub", _return_item_stub)
 
@@ -323,14 +432,16 @@ async def build_orchestrator():
     graph.add_edge("chitchat_node", END)
     graph.add_edge("out_of_scope_node", END)
     graph.add_edge("reset_before_gift_picker", "gift_picker")
+    graph.add_edge("handoff_to_gift_picker", "gift_picker")
     graph.add_conditional_edges("gift_picker", _route_after_gift_picker)
-    graph.add_edge("start_checkout", END)
-    graph.add_conditional_edges("checkout_router", _route_on_checkout_intent)
-    graph.add_edge("handle_collecting_delivery", END)
-    graph.add_edge("handle_awaiting_confirm", END)
-    graph.add_edge("handle_checkout_digression", END)
-    graph.add_edge("cancel_checkout_node", END)
-    graph.add_edge("no_cart_relay", END)
+    graph.add_edge("relay_gift_picker", END)
+    graph.add_edge("enter_checkout_info", "checkout_info_agent")
+    graph.add_conditional_edges("checkout_info_agent", _route_after_checkout_info)
+    graph.add_edge("relay_checkout_info", END)
+    graph.add_edge("enter_confirm", "confirm_agent")
+    graph.add_conditional_edges("confirm_agent", _route_after_confirm)
+    graph.add_edge("relay_confirm", END)
+    graph.add_conditional_edges("check_final_confirmation", _route_after_final_confirmation_check)
     graph.add_edge("track_order_stub", END)
     graph.add_edge("return_item_stub", END)
 
