@@ -1,7 +1,8 @@
 """Checkout — kapruka_create_order has exactly one call site in this whole
 codebase: create_order(), called only from
-src/checkout/flow.py::handle_awaiting_confirm after the deterministic
-confirmation keyword check passes. Never call this from anywhere else.
+src/checkout/flow.py::complete_order, itself only ever invoked by
+src/orchestrator.py's deterministic gate after the confirmation keyword
+check (flow.py::is_confirmation) passes. Never call this from anywhere else.
 
 Field names below (checkout_url, order_ref, summary.grand_total) are
 confirmed directly against the live tool schema (see PLAN.md Phase 3) —

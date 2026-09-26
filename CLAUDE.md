@@ -10,21 +10,26 @@ a real financial action, MCP tool integration) as a portfolio-grade project.
 
 ## Tech stack
 
-- **Orchestration:** LangGraph (`langgraph`) + LangChain — LangGraph agent node for the one
-  real reasoning loop, plain async Python for the deterministic pipeline, a
-  custom `StateGraph` (`ConciergeOrchestrator` graph, see below) for
-  conditional dispatch on the Intent Router's result, compiled graph +
-  `PostgresSaver` checkpointer to drive a turn from the FastAPI webhook
+- **Orchestration:** LangGraph (`langgraph`) + LangChain — LangGraph agent
+  nodes for the real reasoning loops (Gift-Picker, Checkout Info Agent,
+  Confirm Agent — see Agents below), a custom `StateGraph`
+  (`ConciergeOrchestrator` graph, see below) for conditional dispatch on
+  the active classifier/agent's result, compiled graph + `PostgresSaver`
+  checkpointer to drive a turn from the FastAPI webhook
 - **MCP client:** LangChain MCP adapters' `MultiServerMCPClient` — used to load and expose the Kapruka MCP tools to the graph
-- **Human-in-the-loop:** a deterministic graph state's `stage` state
-  machine (`src/checkout/flow.py`), not a deterministic state-machine gate; LangGraph's `interrupt()` is reserved for graph-level human-in-the-loop pauses. See
-  the deterministic pipeline section below for the reasoning and the actual
+- **Human-in-the-loop:** a graph state `stage` state machine driving which
+  agent owns a given turn (`src/orchestrator.py`), narrowed as of Phase 3.6
+  to exactly one literal deterministic gate — the trigger for
+  `kapruka_create_order` (`src/checkout/flow.py::is_confirmation`) — with
+  everything else agentic; LangGraph's `interrupt()` is reserved for
+  graph-level human-in-the-loop pauses and isn't used here. See "The one
+  deterministic gate" section below for the reasoning and the actual
   mechanism.
 - **Entry point:** FastAPI (webhook receiver) — a custom app calling
   the compiled graph's `ainvoke()` per inbound message, not a generic framework scaffold (that assumes a generic chat UI; we need webhook-shaped routing).
   `src/pipeline.py::run_turn()` is the shared "run one turn" call both this
   and the entry points below will use.
-- **Dev/demo UI:** `gradio_app.py` — a minimal `gr.ChatInterface`, not a
+- **Dev/demo UI:** `gradio-chat.py` — a minimal `gr.ChatInterface`, not a
   production entry point. Doesn't use Gradio's own chat-history state as
   memory (conversation memory is the Postgres session, same as everywhere
   else); one throwaway `phone_number` identity per browser session via
@@ -59,17 +64,40 @@ a real financial action, MCP tool integration) as a portfolio-grade project.
 - Orders are REAL — guest checkout creates a live 60-minute pay link. No sandbox.
 - Full tool contracts: `docs/mcp/kapruka-mcp-tools.md`
 
-## Agents — only ONE real reasoning loop in this system
+## Agents — three real reasoning loops now (Phase 3.6 added two)
+
+Through Phase 3.5 there was exactly one real ReAct loop in this system
+(the Gift-Picker) plus two zero-tool structured-output classifiers (Intent
+Router, and the now-retired Checkout Router). Phase 3.6 retired the
+Checkout Router and Phase 3's deterministic one-field-per-turn machinery
+entirely — replaced by two more real agents (Checkout Info Agent, Confirm
+Agent), same class as the Gift-Picker, each scoped to a narrow tool set and
+owning its own judgment. The Intent Router is still the only classifier
+left; everything checkout-shaped is agentic now except one literal
+deterministic keyword gate (see Human Confirm below).
+
+All three checkout-time agents are embedded as literal, always-on subgraph
+nodes (built once at graph-compile time, same mechanism the Gift-Picker
+already used) — per-turn context that a static `system_prompt` string
+can't express (a mid-checkout handoff reason, the current cart, today's
+date, the order summary) reaches them via `dynamic_prompt` middleware,
+which re-evaluates at actual model-call time inside each agent's own ReAct
+loop rather than needing the node rebuilt. Tools that need to read live
+cart/checkout_info without asking the model to retype them as arguments
+use LangGraph's `InjectedState` (with a default value on the parameter —
+**found live**: without one, a field that's genuinely absent on a fresh
+checkout, e.g. `checkout_info` before it's ever been written, raises a
+bare `KeyError` instead of injecting `None`).
 
 ### Gift-Picker Agent
 
-- The only agentic (ReAct-style) node: a LangGraph agent node
-  (`src/gift_picker/agent.py::build_gift_picker_agent`) that searches,
-  evaluates results, refines, decides when the cart is good enough
+- A LangGraph agent node (`src/gift_picker/agent.py::build_gift_picker_agent`)
+  that searches, evaluates results, refines, decides when the cart is good
+  enough — unchanged embedding mechanism since Phase 1/2.
 - Tools: `kapruka_search_products`, `kapruka_get_product`, `kapruka_list_categories`
-  via MCP tools scoped to just these three —
-  it never even sees `kapruka_create_order`. Plus three custom
-  LangChain `@tool`s (`src/gift_picker/tools.py`):
+  via MCP tools scoped to just these three — it never even sees
+  `kapruka_create_order`. Plus custom LangChain `@tool`s
+  (`src/gift_picker/tools.py`):
   - `get_recipient_profile(recipient_name)` — reads the `recipients` table
     (`src/db/recipients.py`, raw async psycopg), matching loosely on name
     OR relationship. Returns `{"matches": [...]}` rather than forcing a
@@ -78,20 +106,82 @@ a real financial action, MCP tool integration) as a portfolio-grade project.
   - `suggest_products(products)` — writes graph state's `product_suggestions`,
     repeatable, each call replaces rather than adds. Live API field is `id`,
     not `product_id`; the instructions and docstring both call this out.
-  - `propose_cart(items, estimated_total, notes)` — writes
-    graph state's `cart`, clears `product_suggestions`. Calling it ends
-    the Gift-Picker's loop for the turn.
-  - `propose_cart`/`suggest_products` are plain LangChain `@tool`s, deliberately
-    NOT structured output like the Router — there's a currently
-    open LangGraph reliability issue (`google/adk-python#3969`) where the model
-    intermittently ignores structured output when it's combined with tools on
-    the same agent.
+  - `propose_cart(items, estimated_total, notes)` — writes graph state's
+    `cart`, clears `product_suggestions`. Cart-only as of Phase 3.6 — no
+    `delivery_city`/`delivery_date` params anymore; delivery details are
+    gathered later by the Checkout Info Agent, once approved.
+  - `confirm_cart_and_proceed()` (Phase 3.6, new) — the customer approved
+    the CURRENT cart with nothing further to change; sets `cart_confirmed`,
+    the orchestrator's signal to advance to the Checkout Info Agent. A
+    `propose_cart` diff alone, even the first one, no longer auto-advances
+    anywhere — this is what actually fixes that.
+  - `cancel_checkout()` (Phase 3.6, shared with the other two agents —
+    `src/checkout/shared_tools.py`) — clears the whole checkout.
+  - `propose_cart`/`suggest_products`/`confirm_cart_and_proceed` are plain
+    LangChain `@tool`s, deliberately NOT structured output like the Router
+    — there's a currently open LangGraph reliability issue
+    (`google/adk-python#3969`) where the model intermittently ignores
+    structured output when it's combined with tools on the same agent.
 - Reads the family profile table (`recipients`); doesn't write to it yet —
-  saving new recipient info is out of scope for this phase
-- Called from the Orchestrator's `gift_request` branch (see below), after
-  the Intent Router has classified the message. Called from two places once
-  phase 2 (proactive, cron-triggered) exists — same agent, different
-  downstream reachability; that path is still deferred (see Scope below).
+  saving new recipient info is out of scope for this phase.
+- Reachable two ways now: fresh, from the Intent Router's `gift_request`
+  classification; and mid-checkout, via `handoff_reason` (set by
+  `request_cart_revision`, called from the Checkout Info or Confirm agent)
+  — same node either way, read by a `dynamic_prompt` middleware that adds
+  "you're being consulted mid-checkout because: {reason}" to its system
+  prompt when non-null.
+
+### Checkout Info Agent (Phase 3.6, new — replaces Phase 3's deterministic Gate 1/2/3)
+
+- `src/checkout/checkout_info_agent.py::build_checkout_info_agent`. Gathers
+  everything `kapruka_create_order` needs besides the cart itself:
+  delivery city, delivery date, recipient name/phone, delivery address,
+  sender name. Replaces `_advance_checkout`'s hard-coded gate ordering with
+  prompt-level sequencing guidance (settle city/date and validate delivery
+  before asking for the rest) — the agent's own judgment, not a code gate.
+- Tools: `resolve_city(query)` (thin wrapper over the existing
+  `src/checkout/delivery.py::resolve_city`), `check_delivery(city, date)`
+  (wraps `check_delivery_for_cart`, reads the live cart via
+  `InjectedState("cart")` — no need to make the model retype cart
+  contents), `finalize_checkout_info(...)` (writes all six fields, merging
+  with whatever `check_delivery` already recorded rather than overwriting
+  it — the `checkout_info_finalized` flag it also sets is the
+  orchestrator's signal to advance to the Confirm Agent), plus the shared
+  `request_cart_revision`/`cancel_checkout`.
+- No lookup/autofill for the new fields — checked `src/db/schema.sql`
+  directly: `recipients` only stores the customer's own name/relationship/
+  preferences, nothing about a recipient's phone or a delivery address.
+- Date resolution ("next thursday," "the 25th") is the agent's own
+  reasoning against today's date (formatted into its prompt), not a regex
+  — `check_delivery` independently rejects anything that isn't a real
+  calendar date at least one day out as a backstop against bad arithmetic,
+  same posture Phase 3's `_invalid_date_reason` had, adapted rather than
+  reused verbatim (that function is retired).
+- On a failed `check_delivery`, or any request to change the cart itself:
+  calls `request_cart_revision` directly — no separate revision node.
+- Never has `kapruka_create_order` — same tool-scoping exclusion as the
+  Gift-Picker.
+
+### Confirm Agent (Phase 3.6, new — replaces `handle_awaiting_confirm`'s non-yes fallback)
+
+- `src/checkout/confirm_agent.py::build_confirm_agent`. Opens every model
+  call with the existing `build_summary` output (unchanged, reused as-is)
+  formatted into its system prompt via `dynamic_prompt` — no separate
+  "show summary" tool.
+- Tools: shared `request_cart_revision`/`cancel_checkout`, plus
+  `ask_final_confirmation()` — arms `awaiting_final_yes` and prompts the
+  model to ask a clear yes/no. **This agent never has
+  `kapruka_create_order` as a tool, verifiable by inspection** — see Human
+  Confirm below for the actual gate.
+- **Found live:** its `dynamic_prompt` callback re-runs on every model call
+  within its own ReAct loop, not just the first — if `cancel_checkout`
+  fires mid-loop (clearing `checkout_info`) and the agent's own ReAct loop
+  then makes one more call to generate its trailing "okay, cancelled!"
+  reply, the callback used to call `build_summary` against an
+  already-cleared `checkout_info` and crash with a bare `KeyError`. Fixed
+  by checking all six required fields are still present before calling
+  `build_summary`, falling back to a placeholder summary text otherwise —
+  `build_summary` itself is untouched.
 
 ## Routers — NOT agentic. Single-shot, no loop.
 
@@ -128,33 +218,19 @@ unconditional. (the graph's message-history handling turned out to be binary —
   on Kapruka (general knowledge, competitor comparisons, off-site requests).
   Watch for shared-vocabulary false positives here (e.g. "check this product
   on eBay" mentioning "product" should NOT become `gift_request`).
-- This is the only place free-text ambiguity gets interpreted — everything
-  downstream of it is either the agent loop or a deterministic pipeline.
+- This is the only place free-text ambiguity gets interpreted for a *fresh*
+  request — everything downstream of it (checkout included, as of Phase
+  3.6) is agentic, except one literal deterministic keyword gate (see
+  Human Confirm below).
 
-### Checkout Router
+**Retired, Phase 3.6:** the Checkout Router (`src/router/checkout_router.py`,
+deleted) — a second structured-output classifier used only mid-checkout.
+Replaced by the Checkout Info and Confirm agents owning their own judgment
+directly, rather than a classifier deciding how to route to deterministic
+handlers. See the Agents section above and the `_route_from_start`
+paragraph below for what replaced it and why.
 
-- A second structured-output classifier (`src/router/checkout_router.py`),
-  same class as the Intent Router (LangGraph agent node, structured output,
-  no tools — genuinely single-shot for the same reason), but used only when
-  graph state's `stage` is set (a checkout is in progress). Deliberately a
-  separate classifier rather than folding checkout-time classification into
-  the Intent Router's 5-way schema — keeps each prompt focused on one job:
-  cold-start intent vs. mid-checkout digression.
-- Classifies into `answers_pending | modify_request | cancel_checkout |
-unrelated`. `answers_pending` also carries `extracted_value`, so a single
-  call both classifies the reply and pulls the structured value out of free
-  text (e.g. "yeah ship it to Colombo 05" → `extracted_value: "Colombo
-05"`) instead of a second round-trip.
-- Needs `stage`, `collecting_field` (which field is actually pending), and a
-  `cart`/`checkout_info` snapshot serialized explicitly into its prompt —
-  none of that lives in the message transcript the way Intent Router
-  context does.
-- **Never a confirmation gate.** `answers_pending` at the `awaiting_confirm`
-  stage is a routing decision, not itself a "yes." See Human Confirm below
-  — `_is_confirmation`'s deterministic keyword check is still the only
-  thing that can trigger `create_order`.
-
-## Orchestrator — dispatches on the active classifier's result
+## Orchestrator — dispatches on the active classifier/agent's result
 
 `src/orchestrator.py::ConciergeOrchestrator`, a custom LangGraph `StateGraph`
 builder — the root graph in `main.py` (and later the FastAPI webhook) drives
@@ -167,17 +243,63 @@ response for `chitchat`/`out_of_scope`, the Gift-Picker sub-agent for
 `gift_request`, a stub (log line + placeholder reply) for
 `track_order`/`return_item` until their phases land.
 
-**Entry routing, before either classifier runs:** `_route_from_start` (a
-conditional edge from `START` itself) checks graph state's `stage` first.
-`stage` absent → the Intent Router runs as described above. `stage` set (a
-checkout already in progress) → the Checkout Router runs instead (see
-Routers section above), and its result dispatches to
-`_advance_checkout`/`handle_awaiting_confirm` (`answers_pending`), back to
-the Gift-Picker sub-agent (`modify_request`/`unrelated` — reusing the same
-hand-back mechanism the Deterministic pipeline section describes for a
-failed delivery check), or a new cancel branch that clears checkout state
-(`cancel_checkout`). Earlier, a stage in progress bypassed classification
-entirely; every turn now goes through one classifier or the other.
+**Entry routing, `_route_from_start` (Phase 3.6 shape):** a conditional
+edge from `START` itself, checking graph state's `stage`. Absent →
+Intent Router (as above). `with_gift_picker` → straight to the Gift-Picker
+node. `checkout_info` → straight to the Checkout Info Agent node.
+`confirm` → the one deterministic gate check first if `awaiting_final_yes`
+is set (see Human Confirm below), otherwise straight to the Confirm Agent.
+No classifier sits in front of any checkout stage anymore — each stage
+routes directly to the agent that owns it.
+
+**Stages, final shape:** `with_gift_picker` (picking/revising a cart,
+reached once a cart is proposed and awaiting approval, or from any
+hand-back out of the other two agents — one destination either way, not
+two the way Phase 3.5's `resolving_delivery_conflict` was a separate name
+for the same thing) | `checkout_info` (gathering everything
+`kapruka_create_order` needs besides the cart) | `confirm` (order summary
+shown, working toward a final yes/no) | absent.
+
+**Single exit condition per stage — what actually fixes the old
+"auto-advance on any cart diff" complaint:** a `propose_cart` diff alone,
+even the very first one, no longer advances anywhere by itself — only
+`confirm_cart_and_proceed` firing (flagged via `cart_confirmed`, reset
+`False` right before every Gift-Picker run) advances `with_gift_picker` ->
+`checkout_info`, and only `finalize_checkout_info` firing (`checkout_info_finalized`,
+same reset pattern) advances `checkout_info` -> `confirm`.
+
+**`handoff_reason` replaces the old `_invoke_gift_picker_for_revision`
+mechanism:** set by the shared `request_cart_revision` tool (Checkout Info
+or Confirm agent), read by the Gift-Picker's `dynamic_prompt` middleware,
+cleared right after the Gift-Picker node runs. Routing on it stays in the
+parent graph, not inside the tool — a `Command(graph=Command.PARENT)` call
+from inside a subgraph's tool was considered and rejected as untested in
+this codebase; a conditional edge checking `handoff_reason` after each
+checkout agent node reuses the same plain-`Command(update=...)` mechanism
+`propose_cart` already proves works, just watched one level up.
+
+**`cancel_checkout` is a shared tool now** (`src/checkout/shared_tools.py`),
+not a router-reached node — any of the three agents can recognize "the
+customer wants out" and call it directly; it clears `stage` to `None`,
+which every post-agent routing check treats as "done, nothing further to
+route this turn."
+
+**Found live, a second instance of the exact bug already documented above
+for the Intent Router:** routing straight from one embedded agent into the
+next within the SAME turn (Gift-Picker -> Checkout Info Agent on
+`cart_confirmed`; Checkout Info -> Confirm Agent on
+`checkout_info_finalized`; either -> Gift-Picker on `handoff_reason`)
+leaves shared `messages` ending on the FIRST agent's own final reply — a
+normal assistant turn, since its ReAct loop always produces one after a
+tool call — and Gemini refuses a request that doesn't end on a user
+message or a function response. This didn't surface until two real agents
+actually chained within one turn, live. Fixed the same way Phase 3's
+`_invoke_gift_picker_for_revision` already fixed an analogous case: each
+transition node injects a synthetic `[System note — not from the
+customer: ...]` `HumanMessage` before handing off. The one exception:
+the deterministic gate's own fall-through to the Confirm Agent needs no
+such note, since that check makes no agent/LLM call itself and `messages`
+still ends on the customer's own real reply.
 
 Not a purely sequential graph — every node in a fixed sequence would run
 unconditionally, with no way to skip based on the classification result. Not the
@@ -201,116 +323,100 @@ expensive full fetch happens regardless once it's needed). The bounded path
 lives on in `classify_intent()`'s own standalone compiled LangGraph call, which is
 what `scripts/test_intent_router.py` exercises.
 
-### `gift_request` dispatch (`ConciergeOrchestrator._run_gift_picker`)
+### `gift_request` dispatch (`reset_before_gift_picker` -> `gift_picker` -> `_route_after_gift_picker`)
 
-1. Yields its own housekeeping a graph state update
-   {"product_suggestions": []}))`before invoking the Gift-Picker — a
-structural reset, not something left to the model to remember. Confirmed
-(by reading the LangGraph compiled LangGraph source) that a yielded event's state update
-is applied to graph state via`append_event` _before_ the
-   generator resumes, so the Gift-Picker sub-agent genuinely sees the reset.
-2. Runs the Gift-Picker as a sub-agent sharing shared graph state, watching its yielded
-   events for a `"cart"` key in `the node's returned state update` — i.e. did
-   `propose_cart` actually fire _this turn_ — rather than checking whether
-   graph state's `cart` merely exists (which could be stale from an
-   earlier turn and would wrongly suppress a genuinely new cart later in
-   the same conversation).
-3. Cart present this turn → hands off to `src/checkout/flow.py::start_checkout`
-   (Phase 3, below). Absent → relay the Gift-Picker's own final text as the
-   orchestrator's own event (keeps "who speaks to the customer" uniformly
-   `concierge_orchestrator`, matching `chitchat`/`out_of_scope`),
-   console-print `product_suggestions` as a stand-in for "cards" until
-   there's a real UI.
+1. `_reset_before_gift_picker` resets `product_suggestions`/`cart_confirmed`
+   and snapshots `cart` before invoking the Gift-Picker — structural, not
+   left to the model to remember.
+2. Runs the Gift-Picker as an embedded subgraph node sharing graph state.
+3. `_route_after_gift_picker` checks `cart_confirmed` (Phase 3.6) — set
+   this turn → advance to the Checkout Info Agent (`enter_checkout_info`,
+   same turn). Not set → relay: sets `stage` to `with_gift_picker` if a
+   cart currently exists (even the first proposal, still awaiting
+   approval) or clears it back to absent otherwise (including right after
+   `cancel_checkout`) — see the **found live** bug note below for why this
+   can't just check "was stage already set."
 
-## Deterministic pipeline — no LLM judgment involved
+**Found live:** `_relay_gift_picker`'s stage-setting originally checked
+"was `stage` already non-`None` going in" to decide whether to keep it at
+`with_gift_picker` — but that's ambiguous: a genuinely fresh `gift_request`
+(stage never set) and a genuine `cancel_checkout` (stage just cleared)
+both look identical from that check (`stage is None` either way), so the
+very first `propose_cart` in a conversation was silently falling back to
+Intent Router re-classification on the next turn instead of staying with
+the Gift-Picker. Fixed by keying off whether `cart` currently exists
+instead — a cart existing means "still with_gift_picker, awaiting
+approval," matching the plan's own framing exactly (only Checkout Info and
+Confirm agents are safe checking "was stage already set," since they're
+never entered from a stage-absent start the way the Gift-Picker is).
 
-`Check Delivery` (`kapruka_check_delivery`) → `Show Summary` → `Human Confirm`
-→ `Checkout` (`kapruka_create_order`) → `Track Order` (`kapruka_track_order`)
+## The one deterministic gate — Human Confirm
 
-`src/checkout/` — plain async Python calling MCP tools directly via a raw
-`mcp` client (`mcp_client.py`), not `MultiServerMCPClient` from `langchain-mcp-adapters`. No agent loop, no
-LLM judgment, with one exception: resolving a conflict re-invokes the
-_same_ Gift-Picker sub-agent (reuse, not a new feature — see below).
+Phase 3.6 retired everything else that used to live under "deterministic
+pipeline": `Check Delivery`/`Show Summary`/one-field-per-turn collection
+are now the Checkout Info Agent's own tool calls and judgment (see Agents
+above). Exactly one thing in the whole system is still deterministic: the
+literal trigger for `kapruka_create_order`.
 
-**Why a raw MCP client instead of `MultiServerMCPClient`:** every Kapruka tool wraps
-its arguments in a single `params` object and supports
-`response_format: "json"` (confirmed against the live tool schemas — not
-guessed), and the JSON payload comes back double-encoded as a JSON _string_
-inside `structuredContent["result"]`, not `structuredContent` itself
-(confirmed via a live call). `MultiServerMCPClient` is built for an LLM's tool-calling
-loop (schema exposure to the model, `interrupt()` tied into LangGraph's
-own flow processor); none of that applies to a deterministic call site, so
-`src/checkout/mcp_client.py::call_kapruka_tool()` talks to the server
-directly instead.
+`src/checkout/flow.py` now holds only `is_confirmation` (the keyword check,
+renamed from `_is_confirmation` — public now since `src/orchestrator.py`
+calls it directly, cross-module, as the literal gate) and `complete_order`
+(wraps `create_order`/`save_order`/`track_order_once`). Everything else
+that used to live here — `_advance_checkout`, `handle_collecting_delivery`,
+`_ask`, `FIELD_PROMPTS`, `_invalid_date_reason`,
+`_invoke_gift_picker_for_revision`, `_hand_back_to_gift_picker`,
+`handle_checkout_digression`, `cancel_checkout_node` as a node — is
+retired, not adapted.
 
-**State machine** (graph state's `stage`, `src/checkout/flow.py`), checked
-by `_route_from_start` to decide which classifier runs a given turn — the
-Checkout Router when a stage is set, the Intent Router otherwise (see
-Orchestrator section above): `collecting_delivery` |
-`resolving_delivery_conflict` | `awaiting_confirm` | absent (normal flow).
-`Check Delivery` runs once per _distinct product_, not once per cart —
-deliverability is scoped per item, not per shipment (food/liquor/hotel-cake
-items reach far fewer cities than flowers). A failed check injects a
-`[System note — not from the customer: ...]` event describing what failed,
-then re-invokes the Gift-Picker sub-agent — the same hand-back mechanism
-the Checkout Router's `modify_request`/`unrelated` results also use, since
-all three cases are really "hand it back to the agent that knows how to
-build a cart."
-
-**`collecting_delivery` collects more than the plan originally named:**
-the live `kapruka_create_order` schema (checked directly, not assumed)
-requires `recipient{name,phone}`, `delivery{address,city,date}`,
-`sender{name}` — not just city/date. `propose_cart` only captures
-city/date (see the Gift-Picker section above); `collecting_delivery` asks
-for whatever else is missing, one field per turn. The field write itself
-still has no LLM judgment — the Checkout Router (see Routers section
-above) is what classifies the reply and extracts the value before
-`_advance_checkout` ever writes it. Known rough edge, still open: the
-Gift-Picker often already states these details in its own narration when
-the customer gives them up front, so re-asking can read as repetitive —
-not fixed by the Checkout Router, would mean growing `propose_cart`'s
-schema further.
-
-**Human Confirm — why not LangGraph's `interrupt()`:** that mechanism's
-pause/resume lives inside LangGraph's graph execution and interrupt mechanism
-(`interrupt()` / checkpointing) and LangGraph's
-resumability feature (confirmed by reading the source, not assumed) —
+**Why not LangGraph's `interrupt()`, still true:** that mechanism's
+pause/resume lives inside LangGraph's own execution/checkpointing, and
 using it here would mean either routing `kapruka_create_order` through an
-LLM agent's tool-calling turn (reintroducing agent/LLM judgment into
-checkout, which this phase is explicitly avoiding) or standing up LangGraph
-resumability just for this one call. Instead, "explicit human confirm" is
-enforced structurally: a deterministic keyword check
-(`src/checkout/flow.py::_is_confirmation`, not a classifier call) gates the
-_only_ call site `kapruka_create_order` has anywhere in this codebase
-(`src/checkout/order.py::create_order`, called only from
-`handle_awaiting_confirm` after that check passes) — verifiable by
-inspection, and live-verified that the gate itself holds (a bare "yes"
-with no checkout in progress does nothing; a non-yes reply during confirm
-does not check out). **Unchanged by the Checkout Router (see Routers
-section above):** its `answers_pending` classification only decides that a
-reply should reach `handle_awaiting_confirm` at all — `_is_confirmation`
-still independently gates `create_order` on the raw text every time.
+LLM agent's tool-calling turn (reintroducing agent/LLM judgment into the
+one place this system deliberately keeps it out) or standing up LangGraph
+resumability just for this one call. Instead: `src/orchestrator.py`'s
+`_route_from_start` checks `stage == "confirm"` AND `awaiting_final_yes`
+(set by the Confirm Agent's `ask_final_confirmation` tool) together — if
+both, `_check_final_confirmation` runs `is_confirmation` directly on the
+customer's raw reply, no agent/LLM call involved in that specific check at
+all. Pass → `complete_order` (the only call site `kapruka_create_order`
+has anywhere in this codebase). Fail → clear `awaiting_final_yes`, fall
+through to the Confirm Agent same turn to actually figure out what the
+customer meant. **Live-verified the gate holds** post-Phase-3.6 exactly
+like it did post-Phase-3: a non-yes reply while `awaiting_final_yes` is
+armed does not check out and correctly falls through to the Confirm Agent
+instead. `kapruka_create_order` itself remains untested against a live
+success response, by design — same deliberate boundary as every prior
+phase, never send a real "yes" during development.
 
-On success: writes `phone_number`, `items` (JSONB), `product_summary`,
-`total_amount`, `delivery_city`, `delivery_date`, `kapruka_order_id`,
-`status` to `orders` (`src/checkout/order.py::save_order` — the `orders`
-table gained those four columns via an `ALTER TABLE` in
-`src/db/schema.sql`), then structurally clears `cart`/`checkout_info`/
-`stage`/`collecting_field`. `Track Order` here
-(`src/checkout/order.py::track_order_once`) is a best-effort immediate
-status check right after checkout — distinct from Phase 4's `track_order`
-_intent_, which is a customer asking about a past order out of the blue.
-Same MCP tool, two different callers.
+**Why `Check Delivery` moved into an agent instead of staying a
+deterministic per-item loop:** Phase 3's `_advance_checkout` hard-coded a
+Gate-1-before-2-before-3 field order and a strict `datetime.strptime`
+date parse that rejected anything but a bare ISO date ("next thursday"
+included). The live `kapruka_create_order` schema (checked directly, not
+assumed) still requires `recipient{name,phone}`, `delivery{address,city,date}`,
+`sender{name}` — `propose_cart` still only captures the cart itself; the
+Checkout Info Agent gathers the rest, with prompt-level sequencing
+guidance (settle city/date, validate delivery, then ask for the rest)
+replacing the old hard gate order, and its own reasoning against an
+injected today's-date replacing the regex date parse.
 
-**Untested against a live success response, by design:** `kapruka_create_order`
-is a real, live financial action (a real pay link), so unlike the rest of
-this pipeline it was never exercised end-to-end during development — the
-whole flow up to `awaiting_confirm` (including a real `kapruka_check_delivery`
-call returning a real delivery fee) was verified live, but no "yes" was
-ever sent. The response field names `create_order`/`save_order` assume
-(`order_ref`, a pay-link key) are inferred from the tool's own schema/docs,
-not confirmed — verify (and adjust if needed) the first time this actually
-runs for real.
+On success (`complete_order`, `src/checkout/flow.py`): writes `phone_number`,
+`items` (JSONB), `product_summary`, `total_amount`, `delivery_city`,
+`delivery_date`, `kapruka_order_id`, `status` to `orders`
+(`src/checkout/order.py::save_order` — the `orders` table gained those
+four columns via an `ALTER TABLE` in `src/db/schema.sql`), then
+structurally clears `cart`/`checkout_info`/`stage`/`handoff_reason`/
+`awaiting_final_yes`. `Track Order` here (`src/checkout/order.py::track_order_once`)
+is a best-effort immediate status check right after checkout — distinct
+from Phase 4's `track_order` _intent_, which is a customer asking about a
+past order out of the blue. Same MCP tool, two different callers.
+
+Response field names (`order_ref`, `checkout_url`, `summary.grand_total`)
+are confirmed directly against the live tool schema, not inferred — see
+Phase 3's own PLAN.md entry. `kapruka_create_order` itself remains
+untested against a live SUCCESS response, by design (see the gate section
+above) — everything up to and including a real `kapruka_check_delivery`
+call has been verified live, but no real "yes" has ever been sent.
 
 **Hard rule: `kapruka_create_order` is only ever called after an explicit
 human confirm. Never let the agent call checkout directly, and never skip
