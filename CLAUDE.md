@@ -243,14 +243,17 @@ response for `chitchat`/`out_of_scope`, the Gift-Picker sub-agent for
 `gift_request`, a stub (log line + placeholder reply) for
 `track_order`/`return_item` until their phases land.
 
-**Entry routing, `_route_from_start` (Phase 3.6 shape):** a conditional
+**Entry routing, `_route_from_start` (Phase 3.7 shape):** a conditional
 edge from `START` itself, checking graph state's `stage`. Absent →
 Intent Router (as above). `with_gift_picker` → straight to the Gift-Picker
 node. `checkout_info` → straight to the Checkout Info Agent node.
-`confirm` → the one deterministic gate check first if `awaiting_final_yes`
-is set (see Human Confirm below), otherwise straight to the Confirm Agent.
-No classifier sits in front of any checkout stage anymore — each stage
-routes directly to the agent that owns it.
+`confirm` → straight to the `confirm_agent` node regardless of
+`awaiting_final_yes` — as of Phase 3.7 that flag is checked INSIDE the
+node's own wrapper function (`_run_confirm_agent`), not at this routing
+layer (see Human Confirm below; Phase 3.6 had a separate
+`check_final_confirmation` node/branch for this, since retired). No
+classifier sits in front of any checkout stage anymore — each stage routes
+directly to the agent that owns it.
 
 **Stages, final shape:** `with_gift_picker` (picking/revising a cart,
 reached once a cart is proposed and awaiting approval, or from any
@@ -373,20 +376,29 @@ pause/resume lives inside LangGraph's own execution/checkpointing, and
 using it here would mean either routing `kapruka_create_order` through an
 LLM agent's tool-calling turn (reintroducing agent/LLM judgment into the
 one place this system deliberately keeps it out) or standing up LangGraph
-resumability just for this one call. Instead: `src/orchestrator.py`'s
-`_route_from_start` checks `stage == "confirm"` AND `awaiting_final_yes`
-(set by the Confirm Agent's `ask_final_confirmation` tool) together — if
-both, `_check_final_confirmation` runs `is_confirmation` directly on the
+resumability just for this one call. Instead (Phase 3.7 shape — folded the
+check into the `confirm_agent` node itself, replacing Phase 3.6's separate
+`check_final_confirmation` node and `_route_from_start` branch):
+`_route_from_start` routes `stage == "confirm"` straight to `confirm_agent`
+regardless of `awaiting_final_yes` (set by the Confirm Agent's
+`ask_final_confirmation` tool); the node's own wrapper function,
+`_run_confirm_agent` (`src/orchestrator.py`), checks `awaiting_final_yes`
+first as plain code — if set, it runs `is_confirmation` directly on the
 customer's raw reply, no agent/LLM call involved in that specific check at
 all. Pass → `complete_order` (the only call site `kapruka_create_order`
 has anywhere in this codebase). Fail → clear `awaiting_final_yes`, fall
-through to the Confirm Agent same turn to actually figure out what the
-customer meant. **Live-verified the gate holds** post-Phase-3.6 exactly
-like it did post-Phase-3: a non-yes reply while `awaiting_final_yes` is
-armed does not check out and correctly falls through to the Confirm Agent
-instead. `kapruka_create_order` itself remains untested against a live
-success response, by design — same deliberate boundary as every prior
-phase, never send a real "yes" during development.
+through in the same function call to the actual compiled Confirm Agent, no
+extra graph hop, to actually figure out what the customer meant.
+**Live-verified the gate holds** post-Phase-3.6, before this Phase 3.7
+relocation: a non-yes reply while `awaiting_final_yes` was armed did not
+check out and correctly fell through to the Confirm Agent instead. The
+safety property itself is unchanged by the Phase 3.7 move (plain code,
+runs before any LLM call, single `complete_order` call site) — only where
+it physically lives moved, from a separate node into the `confirm_agent`
+node's own wrapper — but that specific relocation has not yet been
+re-verified live. `kapruka_create_order` itself remains untested against a
+live success response, by design — same deliberate boundary as every
+prior phase, never send a real "yes" during development.
 
 **Why `Check Delivery` moved into an agent instead of staying a
 deterministic per-item loop:** Phase 3's `_advance_checkout` hard-coded a

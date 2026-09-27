@@ -113,19 +113,30 @@ directly; it clears `stage` to `None`, which every `_route_after_*`
 function below treats as "done, nothing further to route this turn."
 
 **The hard rule, unchanged in spirit since Phase 3 — this is the ONLY
-deterministic gate left in the whole checkout pipeline:** `_route_from_start`
-checks `stage == "confirm"` and `awaiting_final_yes` together. If both,
-`_check_final_confirmation` runs `is_confirmation` (src/checkout/flow.py)
-directly on the customer's raw reply — no agent call, no LLM judgment
-involved in this specific check. Pass -> `complete_order` (the only call
-site `kapruka_create_order` has anywhere in this codebase, reachable only
-from here). Fail -> clear `awaiting_final_yes` and fall through to the
-Confirm Agent, same turn, to actually figure out what the customer meant.
-The Confirm Agent's own `ask_final_confirmation` tool only ARMS this gate
-(sets `awaiting_final_yes`); it never itself decides the outcome, and it
-never has `kapruka_create_order` as a tool — verifiable by inspection,
-exactly the property Phase 3 built this hard rule around in the first
-place.
+deterministic gate left in the whole checkout pipeline:** as of Phase 3.7,
+the check lives INSIDE the `confirm_agent` node itself (`_run_confirm_agent`
+below), not in a separate node/routing branch the way Phase 3.6 had it.
+`_route_from_start` routes `stage == "confirm"` straight to `confirm_agent`
+regardless of `awaiting_final_yes` — that flag is only read inside the
+wrapper now. `_run_confirm_agent` checks `awaiting_final_yes` first; if
+set, it runs `is_confirmation` (src/checkout/flow.py) directly on the
+customer's raw reply — no agent/LLM call at all on this branch. Pass ->
+`complete_order` (the only call site `kapruka_create_order` has anywhere in
+this codebase, reachable only from here) and returns its result directly.
+Fail -> clears `awaiting_final_yes` and falls through, in the same
+function call, to the actual compiled Confirm Agent — same turn, no extra
+graph hop, to actually figure out what the customer meant. `awaiting_final_yes`
+false/unset skips the check entirely (covers `enter_confirm`'s own first
+entry). The Confirm Agent's own `ask_final_confirmation` tool only ARMS
+this gate (sets `awaiting_final_yes`); it never itself decides the outcome,
+and it never has `kapruka_create_order` as a tool — verifiable by
+inspection, exactly the property Phase 3 built this hard rule around in
+the first place. Folding the check into the node (Phase 3.7) collapses
+what used to be two nodes and an extra `_route_from_start` branch
+(`check_final_confirmation`, `_route_after_final_confirmation_check`) into
+one — the safety property itself (plain code, runs before any LLM call,
+single `complete_order` call site) is unchanged, only where it physically
+lives moved.
 """
 
 from typing import Annotated, Literal, Optional, TypedDict
@@ -191,8 +202,6 @@ def _route_from_start(state: ConciergeState) -> str:
     if stage == "checkout_info":
         return "checkout_info_agent"
     if stage == "confirm":
-        if state.get("awaiting_final_yes"):
-            return "check_final_confirmation"
         return "confirm_agent"
     return "intent_router"
 
@@ -347,7 +356,10 @@ def _enter_confirm(state: ConciergeState) -> dict:
 
 def _route_after_confirm(state: ConciergeState) -> str:
     if state.get("stage") is None:
-        return "relay_confirm"
+        # Either complete_order just ran and cleared everything (the
+        # wrapper's fast path), or cancel_checkout fired inside the agent's
+        # own loop (the slow path) — either way, nothing further to route.
+        return END
     if state.get("handoff_reason"):
         return "handoff_to_gift_picker"
     return "relay_confirm"
@@ -358,26 +370,6 @@ def _relay_confirm(state: ConciergeState) -> dict:
     if state.get("stage") is not None:
         update["stage"] = "confirm"
     return update
-
-
-async def _check_final_confirmation(state: ConciergeState, config: RunnableConfig) -> dict:
-    """The hard-rule gate itself — see this module's own docstring. No
-    agent/LLM call anywhere in this function.
-    """
-    reply = state["messages"][-1].text.strip()
-    if not is_confirmation(reply):
-        return {"awaiting_final_yes": False}
-    phone_number = config["configurable"]["thread_id"]
-    return await complete_order(state["cart"], state["checkout_info"], phone_number)
-
-
-def _route_after_final_confirmation_check(state: ConciergeState) -> str:
-    if state.get("stage") is None:
-        # complete_order ran and cleared everything.
-        return END
-    # Not a clear yes — awaiting_final_yes already cleared; let the Confirm
-    # Agent actually engage with whatever the customer said, same turn.
-    return "confirm_agent"
 
 
 def _track_order_stub(state: ConciergeState) -> dict:
@@ -408,6 +400,26 @@ async def build_orchestrator():
     """Compile the root ConciergeOrchestrator graph against the shared checkpointer."""
     graph = StateGraph(ConciergeState)
 
+    confirm_agent_compiled = await build_confirm_agent()
+
+    async def _run_confirm_agent(state: ConciergeState, config: RunnableConfig) -> dict:
+        """Phase 3.7: the deterministic final-yes gate lives here now, as
+        plain code that runs before the underlying compiled Confirm Agent
+        is ever invoked — not a separate node/routing branch the way
+        Phase 3.6 had it (`check_final_confirmation` /
+        `_route_after_final_confirmation_check`, both retired). See this
+        module's own docstring, hard-rule section, for the full reasoning.
+        """
+        if state.get("awaiting_final_yes"):
+            reply = state["messages"][-1].text.strip()
+            if is_confirmation(reply):
+                phone_number = config["configurable"]["thread_id"]
+                return await complete_order(state["cart"], state["checkout_info"], phone_number)
+            # Not a clear yes — clear the gate, then fall through to the
+            # real agent in this same call, no extra graph hop needed.
+            state = {**state, "awaiting_final_yes": False}
+        return await confirm_agent_compiled.ainvoke(state, config)
+
     graph.add_node("intent_router", _run_intent_router)
     graph.add_node("extract_intent", _extract_intent)
     graph.add_node("chitchat_node", _chitchat_node)
@@ -420,9 +432,8 @@ async def build_orchestrator():
     graph.add_node("checkout_info_agent", await build_checkout_info_agent())
     graph.add_node("relay_checkout_info", _relay_checkout_info)
     graph.add_node("enter_confirm", _enter_confirm)
-    graph.add_node("confirm_agent", await build_confirm_agent())
+    graph.add_node("confirm_agent", _run_confirm_agent)
     graph.add_node("relay_confirm", _relay_confirm)
-    graph.add_node("check_final_confirmation", _check_final_confirmation)
     graph.add_node("track_order_stub", _track_order_stub)
     graph.add_node("return_item_stub", _return_item_stub)
 
@@ -441,7 +452,6 @@ async def build_orchestrator():
     graph.add_edge("enter_confirm", "confirm_agent")
     graph.add_conditional_edges("confirm_agent", _route_after_confirm)
     graph.add_edge("relay_confirm", END)
-    graph.add_conditional_edges("check_final_confirmation", _route_after_final_confirmation_check)
     graph.add_edge("track_order_stub", END)
     graph.add_edge("return_item_stub", END)
 

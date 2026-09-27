@@ -946,6 +946,81 @@ Confirm Agent `dynamic_prompt` cancellation-mid-loop fix, both detailed in
 their respective sections above) — the run that finally succeeded
 end-to-end is the one summarized here.
 
+## Phase 3.7 — Fold the deterministic confirm gate into `confirm_agent` itself (code complete 2026-09-27, live verification still pending)
+
+**Problem being fixed:** Phase 3.6 ended up with two nodes doing what's
+really one job. `check_final_confirmation` exists purely to run
+`is_confirmation` on the raw reply before the real Confirm Agent ever gets
+a turn, and `_route_from_start` has to branch on `awaiting_final_yes` just
+to pick between the two node names. That's a whole extra node and a whole
+extra conditional-edge branch for what's really a two-line check.
+
+**Decision:** the check moves inside `confirm_agent`'s own function, as
+plain code that runs before the underlying compiled agent is ever invoked
+— not something the LLM decides, same deterministic keyword check as
+before, just relocated, not weakened. `check_final_confirmation` and
+`_route_after_final_confirmation_check` are retired; `_route_from_start`
+loses the `awaiting_final_yes` branch entirely.
+
+- [x] The `confirm_agent` node stops being the compiled agent embedded
+      directly (the pattern Phase 3.6 used, matching the Gift-Picker/
+      Checkout Info Agent) — it becomes a wrapping function,
+      `_run_confirm_agent`, same shape as Phase 1's `_run_intent_router`:
+      - Checks `awaiting_final_yes` first. If set, runs `is_confirmation`
+        on the raw reply directly — no call to the underlying LLM agent
+        at all on this branch.
+      - Pass → calls `complete_order` and returns its result directly —
+        identical to what `check_final_confirmation` already did, just
+        from inside this function instead of a separate node.
+      - Fail → clears `awaiting_final_yes` to `False`, then falls through
+        in the same function call to invoke the actual compiled
+        `confirm_agent` — no extra graph hop needed, since it's now
+        sequential code in one function rather than two nodes connected
+        by an edge.
+      - `awaiting_final_yes` false or unset → skips the check entirely,
+        goes straight to the compiled agent — covers `enter_confirm`'s own
+        first entry, where it's always `False`.
+- [x] `_route_from_start`'s `stage == "confirm"` branch drops the
+      `awaiting_final_yes` check — always routes to `confirm_agent` (the
+      new wrapper) regardless of that flag; the flag is only read inside
+      the wrapper now, not at the routing layer.
+- [x] `_route_after_confirm` (the one remaining post-node router) picks up
+      `_route_after_final_confirmation_check`'s `stage is None → END`
+      check as its first condition, ahead of its existing
+      `handoff_reason`/`relay_confirm` checks — needed since the
+      wrapper's fast path can now itself produce `stage: None` (via
+      `complete_order`) on the same node that also handles the slow,
+      agentic path. `check_final_confirmation` and
+      `_route_after_final_confirmation_check` are removed once this is
+      folded in — nothing else calls either.
+- [x] Net effect: one node instead of two for the entire confirm stage,
+      one fewer conditional-edge branch in `_route_from_start`. The
+      actual safety property is unchanged — `is_confirmation` still runs
+      as plain code, still runs before any LLM call on that turn,
+      `complete_order` still has exactly one call site (now inside
+      `_run_confirm_agent` instead of `_check_final_confirmation`) — only
+      where the check physically lives moves, not what it does or when it
+      runs relative to the agent.
+
+**Explicitly not part of this phase, flagged rather than decided:** a
+second, narrow, tool-less classifier for replies that fail
+`is_confirmation` but are still plausibly a "yes" in different words (e.g.
+"great, let's do this") was discussed as a follow-on — not included here.
+As things stand, that class of reply still falls through to the full
+Confirm Agent, which re-engages and re-arms the gate on its own judgment,
+same as any other non-matching reply.
+
+- [ ] Verify live: a genuine "yes" while `awaiting_final_yes` is armed
+      still reaches `complete_order` without invoking the compiled Confirm
+      Agent at all this turn (confirms the LLM truly isn't in this call
+      path, not just that the outcome looks the same).
+- [ ] Verify live: a non-matching reply while armed still correctly falls
+      through to the real agent in the same turn, same behavior as Phase
+      3.6's own equivalent test.
+- [ ] Verify live: `enter_confirm`'s first-entry turn (`awaiting_final_yes`
+      freshly `False`) is unaffected — still reaches the real agent
+      directly, same as today.
+
 ## Phase 4 — Track-order branch
 
 - [ ] Order-number extraction (ask if missing) → `kapruka_track_order` →
