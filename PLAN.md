@@ -1021,6 +1021,185 @@ same as any other non-matching reply.
       freshly `False`) is unaffected — still reaches the real agent
       directly, same as today.
 
+## Phase 3.8 — Order persistence: `orders`/`order_products` schema, cart items carry product + image URLs (built and verified live 2026-09-27)
+
+**Found while implementing, not anticipated in the plan:** the live
+`orders` table already had 1 real row (`id=1`, `kapruka_order_ref
+ORD-20260927-CG7A`, `phone_number '+94_console_dev'`, created
+2026-09-27) — a real `kapruka_create_order` call was made at some point
+outside this session (this phase's own migration is destructive —
+`DROP COLUMN items`/`product_summary` — so this was checked directly
+before writing any migration SQL, not assumed empty the way Phase 0 found
+it). Flagged and confirmed with the customer before applying — explicit
+go-ahead given to drop that row's `items`/`product_summary` data rather
+than backfill it; the row itself (`id=1`) was left in place, just with
+those two now-dropped columns' data gone.
+
+**Problem being fixed:** right now, a completed order's data exists in two
+places, both fragile: the `checkout_url` shown to the customer once in
+`complete_order`'s reply text (never persisted — if that message is lost,
+so is the payment link), and a single JSONB blob in the existing `orders`
+table (`items`, `product_summary`) with no per-product detail, no pricing
+breakdown, and no way to look anything up without a customer supplying
+context the bot would otherwise have to pull from message history. Phase 4
+needs a `phone_number` → order lookup that doesn't depend on history at
+all — this phase is what makes that possible.
+
+**Decision:** extend the existing `orders` table (not a new, differently
+named table — `order` is a reserved SQL keyword and would need quoting
+everywhere) with the fields `complete_order` already has on hand but
+doesn't currently save, add a new `order_products` table for per-item
+detail, and align every new column name with the field names
+`checkout_info`/`create_order` already use — `sender_name` (not `from`,
+also reserved), `delivery_fee` (not `delivery_price` — matches Kapruka's
+own response field), `delivery_address`, `delivery_city` — so `save_order`
+needs no translation layer between what it already has and what it writes.
+
+### `orders` table changes (`src/db/schema.sql`)
+- [x] Add columns: `payment_url TEXT`, `payment_url_expires_at TIMESTAMPTZ`,
+      `items_total NUMERIC`, `delivery_fee NUMERIC`, `addons_total NUMERIC`
+      (Kapruka's real response splits the total into these three plus
+      `grand_total` — the existing `total_amount` column already holds
+      `grand_total`; storing all three components rather than just
+      `delivery_fee` alone means the numbers can be reconciled later
+      instead of dropping `addons_total` silently), `currency TEXT`,
+      `delivery_address TEXT`, `recipient_name TEXT`, `recipient_phone
+      TEXT`, `sender_name TEXT`.
+- [x] Rename `kapruka_order_id` → `kapruka_order_ref`, matching
+      `order_result.get("order_ref")`'s own field name exactly — same
+      guarded, idempotent migration pattern already used for
+      `owner_contact` → `phone_number` in this same file
+      (`DO $$ ... IF EXISTS ... THEN ALTER TABLE ... RENAME COLUMN ...`).
+- [x] Drop `items` (JSONB) and `product_summary` — both fully superseded
+      by `order_products` below; keeping either would be a second source
+      of truth that could silently drift from the real per-product rows.
+- [x] `phone_number`, `status`, `delivery_city`, `delivery_date`,
+      `total_amount`, `created_at` — already exist, unchanged.
+
+### New `order_products` table
+- [x] `id SERIAL PRIMARY KEY`, `order_id INTEGER REFERENCES orders(id)`,
+      `kapruka_product_id TEXT`, `product_name TEXT`, `product_url TEXT`,
+      `product_image_url TEXT`, `unit_price NUMERIC`, `quantity INTEGER`,
+      `created_at TIMESTAMPTZ NOT NULL DEFAULT now()`. Index on `order_id`.
+
+### Cart items need to carry `url`/`image_url` through — they currently don't
+- [x] `propose_cart`'s docstring (`src/gift_picker/tools.py`) only requires
+      `product_id`, a plain `price`, and "whatever name info you have" per
+      item — it never mentions `url` or `image_url`, even though
+      `suggest_products`'s own `ProductSuggestion` schema already captures
+      both a step earlier in the same conversation. Update the docstring
+      to explicitly require both fields per cart item, same tightened,
+      explicit-example style already used for the `product_id` exact-case
+      rule — a docstring here is guidance, not a guarantee, per this
+      project's own established finding (the price-shape bug, the
+      product_id re-casing bug), so vague wording has a known track record
+      of being followed loosely.
+- [ ] **Residual risk worth flagging, not glossing over:** unlike
+      `product_id` (trivially copy-paste-able), `url`/`image_url` require
+      the model to still be carrying a value forward from an earlier
+      `suggest_products`/`kapruka_get_product` call, potentially several
+      turns back. `GIFT_PICKER_INSTRUCTIONS`'s existing "never describe a
+      product without having looked it up" rule should make this mostly
+      self-satisfying, but it hasn't been exercised in a longer, multi-turn
+      conversation the way the immediate lookup-then-cart pattern already
+      has — worth a dedicated live test, not assumed to just work because
+      the shorter-conversation tests passed.
+
+### Fix the hardcoded quantity bug, found while designing this phase
+- [x] `create_order` (`src/checkout/order.py`) currently sends
+      `"quantity": 1` for every cart item unconditionally, regardless of
+      what's actually in `cart["items"]`:
+      `{"product_id": item["product_id"], "quantity": 1}`. A `quantity`
+      column on `order_products` is meaningless while this stays broken —
+      fix to `item.get("quantity", 1)`.
+- [x] **Real design fork, not just a one-line change — `propose_cart`'s
+      docstring has never said anything about quantity at all** (checked
+      directly, not assumed). Two different cart shapes are both
+      consistent with that silence: the Gift-Picker could be expected to
+      emit one row per unit (two chocolates = two identical `product_id`
+      entries) or one row per distinct product with an explicit
+      `quantity` field. Decide which before writing `finalize_checkout_info`/
+      `order_products`-insert logic that assumes one or the other — the
+      docstring update above should make the chosen shape explicit rather
+      than leaving it to be inferred. **Decided: one row per distinct
+      product_id, explicit `quantity` field** — matches
+      `kapruka_create_order`'s own `{product_id, quantity}` cart-item shape
+      (which already had a `quantity` field sitting unused/hardcoded), and
+      avoids `order_products` carrying N identical rows for N units of the
+      same product.
+
+### `save_order` rewrite (`src/checkout/order.py`)
+- [x] Becomes a two-table insert: one `orders` row (`checkout_info`'s
+      fields map 1:1 now that names match, plus `order_result`'s
+      `summary.*`/`checkout_url`/`order_ref`), then one `order_products`
+      row per cart item. Run inside a single transaction — a partial
+      failure leaving an `orders` row with no matching `order_products`
+      rows is a new failure mode a two-table insert introduces that the
+      old single-table version never had. (`pool.connection()`'s own
+      context manager already commits-on-clean-exit/rolls-back-on-exception
+      per connection, so both inserts sharing one `async with pool.connection()`
+      block gets this for free — no explicit `BEGIN`/`COMMIT` needed.)
+- [x] `payment_url_expires_at` computed at insert time as
+      `now() + interval '60 minutes'` — Kapruka's own guest-checkout
+      pay-link window, confirmed from the tool's own documented behavior,
+      not guessed.
+- [x] `summary.delivery_fee`/`summary.addons_total` read defensively
+      (`.get(...)`, allow null) — this project's own build log only
+      explicitly confirmed `summary.grand_total` against a live response
+      so far (Phase 3); treat the other two the same cautious way
+      `_item_price` already handles inconsistent price shapes elsewhere,
+      rather than assuming the tool's documented schema and the live
+      response agree on every field.
+
+### Not this phase's job — context for why this phase exists
+- [ ] The actual track-order intent handler (order-number extraction,
+      `kapruka_track_order`, formatting a reply) stays Phase 4's work.
+      This phase only makes the lookup possible: `phone_number` →
+      `orders`, joined to `order_products` for per-item detail, in place
+      of pulling that context from message history.
+
+### Verification checklist — migration applied live 2026-09-27 (existing
+`orders` row id=1 predates this phase, left in place with the now-dropped
+columns' data gone, per explicit go-ahead — see the found-live note above)
+- [x] `schema.sql`'s migration re-applies cleanly a second time against the
+      live Neon instance (idempotent) — same bar the existing
+      `owner_contact` migration already meets. **Verified live**: ran
+      `scripts/check_db.py` twice in a row against the real Neon instance,
+      no errors either time.
+- [x] Rewritten `save_order` tested directly against a fabricated
+      `order_result` (not a live Kapruka call — same "never fire a real
+      create_order in dev" boundary as every other checkout test in this
+      codebase) confirms both tables populate correctly, including
+      `product_url`/`product_image_url` on every `order_products` row.
+      **Verified live**: a fabricated 2-item cart (`quantity` 2 and 1,
+      default) round-tripped through the real `save_order` against the
+      real Neon instance — `orders` row had every field populated
+      correctly (`items_total`/`delivery_fee`/`addons_total`/`currency`
+      from `summary`, all six `checkout_info` fields, `payment_url`,
+      correct `kapruka_order_ref`), both `order_products` rows had correct
+      `product_url`/`product_image_url`/`unit_price`/`quantity`. Test rows
+      deleted immediately after (`TEST-VERIFY-3.8`).
+- [x] A cart item with `quantity` > 1 reaches Kapruka's real `quantity`
+      field correctly, not hardcoded `1`. **Verified directly** (not
+      against the live Kapruka MCP call itself, same "never fire a real
+      create_order" boundary): monkeypatched `call_kapruka_tool` to
+      capture `create_order`'s own outgoing params without a network
+      call — a `quantity: 3` item and a quantity-omitted item both
+      produced the correct request shape (`3` and `1`/default,
+      respectively), confirming the hardcode is actually gone, not just
+      the line of code that used to say `1`.
+- [x] `payment_url_expires_at` lands roughly 60 minutes after `created_at`
+      on a real inserted row. **Verified live**: the test row's
+      `payment_url_expires_at` was exactly `created_at + 1:00:00`.
+- [ ] A longer, multi-turn conversation (lookup a product several turns
+      before it's actually added to the cart) still produces a correct
+      `url`/`image_url` on the resulting cart item — the specific residual
+      risk flagged above, not covered by the shorter existing tests. Not
+      run — needs a real multi-turn Gift-Picker/Gemini conversation, not
+      just a DB-layer check; deferred rather than spending live LLM/Kapruka
+      rate-limit budget on it speculatively, same call this project has
+      made before for lower-priority live tests.
+
 ## Phase 4 — Track-order branch
 
 - [ ] Order-number extraction (ask if missing) → `kapruka_track_order` →

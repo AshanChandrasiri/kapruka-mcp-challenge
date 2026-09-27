@@ -37,14 +37,67 @@ CREATE INDEX IF NOT EXISTS idx_recipients_phone_number ON recipients (phone_numb
 CREATE TABLE IF NOT EXISTS orders (
     id SERIAL PRIMARY KEY,
     phone_number TEXT NOT NULL,
-    items JSONB,
-    product_summary TEXT,
     total_amount NUMERIC,
+    items_total NUMERIC,
+    delivery_fee NUMERIC,
+    addons_total NUMERIC,
+    currency TEXT,
     delivery_city TEXT,
     delivery_date DATE,
-    kapruka_order_id TEXT,
+    delivery_address TEXT,
+    recipient_name TEXT,
+    recipient_phone TEXT,
+    sender_name TEXT,
+    payment_url TEXT,
+    payment_url_expires_at TIMESTAMPTZ,
+    kapruka_order_ref TEXT,
     status TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Phase 3.8 migration from the Phase 3 shape (kapruka_order_id, items JSONB,
+-- product_summary) — guarded/idempotent, same pattern as owner_contact ->
+-- phone_number above. items/product_summary are fully superseded by the
+-- order_products table below (per-product rows, not a JSONB/text blob).
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'orders' AND column_name = 'kapruka_order_id'
+    ) THEN
+        ALTER TABLE orders RENAME COLUMN kapruka_order_id TO kapruka_order_ref;
+    END IF;
+END $$;
+
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS items_total NUMERIC;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_fee NUMERIC;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS addons_total NUMERIC;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS currency TEXT;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_address TEXT;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS recipient_name TEXT;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS recipient_phone TEXT;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS sender_name TEXT;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_url TEXT;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_url_expires_at TIMESTAMPTZ;
+ALTER TABLE orders DROP COLUMN IF EXISTS items;
+ALTER TABLE orders DROP COLUMN IF EXISTS product_summary;
+
 CREATE INDEX IF NOT EXISTS idx_orders_phone_number ON orders (phone_number);
+
+-- Phase 3.8: per-product detail, replacing the old items JSONB blob — one
+-- row per distinct product in the cart, with an explicit quantity column
+-- (see src/gift_picker/tools.py::propose_cart's docstring for the cart-item
+-- shape this assumes: one row per distinct product_id, not one row per unit).
+CREATE TABLE IF NOT EXISTS order_products (
+    id SERIAL PRIMARY KEY,
+    order_id INTEGER REFERENCES orders(id),
+    kapruka_product_id TEXT,
+    product_name TEXT,
+    product_url TEXT,
+    product_image_url TEXT,
+    unit_price NUMERIC,
+    quantity INTEGER,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_order_products_order_id ON order_products (order_id);

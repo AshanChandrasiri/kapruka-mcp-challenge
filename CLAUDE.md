@@ -412,13 +412,26 @@ guidance (settle city/date, validate delivery, then ask for the rest)
 replacing the old hard gate order, and its own reasoning against an
 injected today's-date replacing the regex date parse.
 
-On success (`complete_order`, `src/checkout/flow.py`): writes `phone_number`,
-`items` (JSONB), `product_summary`, `total_amount`, `delivery_city`,
-`delivery_date`, `kapruka_order_id`, `status` to `orders`
-(`src/checkout/order.py::save_order` — the `orders` table gained those
-four columns via an `ALTER TABLE` in `src/db/schema.sql`), then
-structurally clears `cart`/`checkout_info`/`stage`/`handoff_reason`/
-`awaiting_final_yes`. `Track Order` here (`src/checkout/order.py::track_order_once`)
+On success (`complete_order`, `src/checkout/flow.py`): as of Phase 3.8,
+`src/checkout/order.py::save_order` is a two-table transactional insert,
+not the old single JSONB-blob row — one `orders` row (`phone_number`,
+`total_amount`/`items_total`/`delivery_fee`/`addons_total`/`currency` from
+`order_result["summary"]`, the six `checkout_info` fields, `payment_url`
+(`order_result["checkout_url"]`) plus a `payment_url_expires_at` computed
+as `now() + 60 minutes` — Kapruka's own guest-checkout pay-link window,
+`kapruka_order_ref` (`order_result["order_ref"]`), `status`), then one
+`order_products` row per cart item (`kapruka_product_id`, `product_name`,
+`product_url`, `product_image_url`, `unit_price`, `quantity`) — replacing
+the old `items` (JSONB) / `product_summary` columns entirely, dropped in
+the same migration. `product_url`/`product_image_url` depend on
+`propose_cart` actually carrying `url`/`image_url` forward per item (its
+docstring was tightened in Phase 3.8 to require both, plus an explicit
+`quantity` field — one row per distinct product, never one row per unit;
+`create_order`'s own cart-quantity was previously hardcoded to `1`
+regardless of what was in the cart, fixed to `item.get("quantity", 1)` in
+the same phase). Then structurally clears
+`cart`/`checkout_info`/`stage`/`handoff_reason`/`awaiting_final_yes`.
+`Track Order` here (`src/checkout/order.py::track_order_once`)
 is a best-effort immediate status check right after checkout — distinct
 from Phase 4's `track_order` _intent_, which is a customer asking about a
 past order out of the blue. Same MCP tool, two different callers.
