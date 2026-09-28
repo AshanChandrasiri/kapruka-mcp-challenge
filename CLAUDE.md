@@ -42,17 +42,21 @@ a real financial action, MCP tool integration) as a portfolio-grade project.
   whatever loop received the HTTP request. `main.py` (console) doesn't need
   this — a bare `asyncio.run()` picks up the policy fine on its own.
 - **State / profile store:** PostgreSQL, hosted on Neon. `src/db/schema.sql`
-  holds the hand-rolled `recipients`/`orders` tables (family profile, order
-  history). LangGraph's `PostgresSaver` checkpointer — `src/session.py`,
-  `get_checkpointer()`, a cached singleton — points at the _same_ Neon
-  instance for turn-by-turn conversation state, so both live in one
-  database, in separate tables (LangGraph owns its checkpoint schema; ours
-  is `recipients`/`orders`). Session identity convention, used by every
-  component: `phone_number == user_id == session_id`
-  (`src/session.py::session_identity`) — one shared conversation, not a
-  per-component one. Windows note: psycopg3's async mode needs
-  `WindowsSelectorEventLoopPolicy` (default `ProactorEventLoop` doesn't
-  support it) — set at import time in `src/session.py`.
+  holds the hand-rolled `recipients`/`orders`/`order_products` (Phase 3.8)/
+  `threads` (Phase 4) tables (family profile, order history, per-item order
+  detail, thread<->customer mapping). LangGraph's `PostgresSaver`
+  checkpointer — `src/session.py`, `get_checkpointer()`, a cached singleton
+  — points at the _same_ Neon instance for turn-by-turn conversation state,
+  so both live in one database, in separate tables (LangGraph owns its
+  checkpoint schema; ours is `recipients`/`orders`/`order_products`/
+  `threads`). Identity convention: `phone_number` is the permanent customer
+  identity (`user_id == session_id == phone_number`, unchanged since
+  Phase 1); `thread_id` is a separate, per-conversation value as of
+  Phase 4 (`src/session.py::session_identity(phone_number, thread_id)`) —
+  see the Chat identity section below for why and how. Windows note:
+  psycopg3's async mode needs `WindowsSelectorEventLoopPolicy` (default
+  `ProactorEventLoop` doesn't support it) — set at import time in
+  `src/session.py`.
 - **LLM:** Google Gemini via LangChain (`langchain-google-genai`) — the configured Gemini API for local
   dev; the model integration can be switched later if needed
 
@@ -433,7 +437,7 @@ the same phase). Then structurally clears
 `cart`/`checkout_info`/`stage`/`handoff_reason`/`awaiting_final_yes`.
 `Track Order` here (`src/checkout/order.py::track_order_once`)
 is a best-effort immediate status check right after checkout — distinct
-from Phase 4's `track_order` _intent_, which is a customer asking about a
+from Phase 5's `track_order` _intent_, which is a customer asking about a
 past order out of the blue. Same MCP tool, two different callers.
 
 Response field names (`order_ref`, `checkout_url`, `summary.grand_total`)
@@ -446,6 +450,84 @@ call has been verified live, but no real "yes" has ever been sent.
 **Hard rule: `kapruka_create_order` is only ever called after an explicit
 human confirm. Never let the agent call checkout directly, and never skip
 the confirmation step "to save a round trip."**
+
+## Chat identity — thread_id decoupled from phone_number (Phase 4)
+
+Through Phase 3.8.1, `session_identity` collapsed `thread_id = user_id =
+session_id = phone_number` — a WhatsApp-shaped assumption (one customer,
+one conversation, forever, no concept of "starting over"). Phase 4 moves
+to a normal chat-agent interface instead, where the client owns
+conversation boundaries the way Claude.ai/ChatGPT's own "New Chat" button
+already does — there's no reason left to guess session boundaries the way
+a phone-number-only integration would have to.
+
+`phone_number` stays the permanent customer identity, keying
+`recipients`/`orders`/`order_products`/`threads` — nothing about that
+changes. `thread_id` is now independent: `src/pipeline.py::run_turn(
+phone_number, message, thread_id=None)` generates a fresh one (`uuid4()`)
+whenever the caller doesn't supply one — that's the actual "no thread_id
+means a new chat" mechanism — and returns `(reply_text, thread_id)` so the
+caller can persist and reuse it on the next call. **Verified live, against
+the real checkpointer, not just by signature:** two turns on the same
+`thread_id` land in the same checkpoint (4 messages after 2 turns);
+supplying no `thread_id` a second time under the same `phone_number`
+produces a genuinely separate checkpoint (a fresh 1-turn history) — the
+decoupling was checked directly against `checkpointer.aget_tuple`, not
+inferred from the reply text (a plain-text reply can look identical
+either way for `chitchat`/`out_of_scope`-shaped messages).
+
+**New `threads` table** (`src/db/schema.sql`, `src/db/threads.py::touch_thread`)
+— `AsyncPostgresSaver` only knows about `thread_id`s, not which customer
+any of them belong to, so without this table there's no way to answer
+"show this customer their past chats" at all (the surface itself isn't
+built yet, just made possible). One upsert per turn
+(`INSERT ... ON CONFLICT (thread_id) DO UPDATE SET last_active_at = now()`)
+handles both "first time this thread_id is seen" (inserts) and "every
+other turn" (updates `last_active_at`) in one statement.
+
+`main.py`'s `THREAD_ID` constant is a hardcoded placeholder, not the real
+mechanism — the console has no way to simulate "a client starting a new
+chat," so it just keeps local dev/testing continuous across restarts.
+`gradio-chat.py` generates its own throwaway `thread_id` once per browser
+session (a second `gr.State` callable-default, same pattern as its
+existing `phone_number` one) rather than round-tripping through
+`run_turn`'s own generation, since it wants one continuous conversation
+per tab. The real behavior (a caller genuinely choosing to pass or omit
+`thread_id` per request) is only meaningfully exercised once the FastAPI
+webhook exists.
+
+**History compaction after a completed order** — no longer the primary
+defense against unbounded history growth (the New Chat boundary is); a
+narrower safety net for a customer who keeps talking in the same thread
+after checkout. `src/checkout/flow.py::complete_order` builds a short
+summary (products, order ref, delivery city/date, `Cart["notes"]` if
+present — Kapruka's own `gift_message` field isn't folded in, since
+`checkout_info` doesn't carry it at all yet, see Phase 3.8's own flagged
+gap) and returns it as `order_summary_for_compaction`, read directly off
+`ainvoke`'s return value by `run_turn` — not re-fetched from state — right
+after that turn's graph invocation returns. `src/checkout/compaction.py::compact_thread`
+then runs as a deliberately separate step (never inside a still-running
+graph invocation, where its own checkpoint writes would race the graph's
+own end-of-step write and lose): `checkpointer.adelete_thread(thread_id)`
+followed by `graph.aupdate_state(config, {...}, as_node="confirm_agent")`
+to seed one fresh checkpoint holding just the summary. Not atomic — a
+crash between the two calls leaves the thread's checkpoint history empty,
+not corrupted; accepted on purpose, since the order itself is already
+safely committed to `orders`/`order_products` by this point, so the worst
+case is lost chat context, not lost order data. Failures are logged, not
+swallowed silently, and can never affect the already-completed order —
+compaction only runs after `complete_order`'s own transaction has already
+succeeded, in a separate step with its own independent try/except.
+**Verified live, against the real orchestrator and real Neon (no real
+order involved — a fabricated summary string was reseeded directly,
+never `kapruka_create_order`):** a 2-turn thread (4 messages) was
+compacted down to exactly 1 message; the very next real turn on that same
+`thread_id` correctly continued from the summary (3 messages: summary +
+new turn), not the pre-compaction history — resolving what was flagged as
+a genuinely open risk during design (delete-then-reseed against the real
+subgraph-based orchestrator, not just a stand-in graph, had never been
+exercised). A forced compaction failure (simulated) was confirmed caught
+and logged without propagating or affecting anything already written.
 
 ## Known capability gap
 

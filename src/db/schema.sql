@@ -101,3 +101,19 @@ CREATE TABLE IF NOT EXISTS order_products (
 );
 
 CREATE INDEX IF NOT EXISTS idx_order_products_order_id ON order_products (order_id);
+
+-- Phase 4: thread_id is decoupled from phone_number (src/session.py) so a
+-- client can own conversation boundaries (a "New Chat" button) instead of
+-- one phone number meaning exactly one conversation forever. AsyncPostgresSaver
+-- only knows about thread_ids, not which customer any of them belong to —
+-- without this table there's no way to answer "show this customer their
+-- past chats" at all (the surface itself isn't built in this phase, just
+-- made possible).
+CREATE TABLE IF NOT EXISTS threads (
+    thread_id TEXT PRIMARY KEY,
+    phone_number TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_active_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_threads_phone_number ON threads (phone_number);

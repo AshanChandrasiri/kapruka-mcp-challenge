@@ -1200,16 +1200,265 @@ columns' data gone, per explicit go-ahead — see the found-live note above)
       rate-limit budget on it speculatively, same call this project has
       made before for lower-priority live tests.
 
-## Phase 4 — Track-order branch
+## Phase 3.8.1 — Prevent modification of a placed order (built and verified live 2026-09-28)
+
+**Problem being fixed:** `complete_order`'s own success path clears
+`stage` to `None` (see Phase 3.6) — so a "can you change my order" message
+arriving right after checkout has nothing left routing it to the Confirm
+Agent. `_route_from_start` only reaches the Confirm Agent when
+`stage == "confirm"`, and that stage is already gone by the time this
+message arrives; it isn't a judgment call the Confirm Agent could make
+even in principle, it's structurally unreachable. The message falls
+through to the Intent Router instead, same as any fresh turn — and none
+of the five existing intents (`gift_request` / `track_order` /
+`return_item` / `chitchat` / `out_of_scope`) obviously fit "modify a
+just-placed order." Left unhandled, it risks landing on `out_of_scope`,
+declining someone who still wants help.
+
+**Decision:** Kapruka has no modify tool anywhere in its MCP surface — so
+any change to a placed order is necessarily a brand-new order, which is
+exactly what the Gift-Picker already does every day. Reuse it rather than
+building a new stage or node. **Scoped to modification only, for now** —
+cancellation-shaped requests ("cancel my order," "undo my order") are
+explicitly out of scope for this phase, not silently folded in. A
+deliberate scope decision, not an oversight; revisit separately once
+cancellation itself gets designed.
+
+- [x] Intent Router instructions (`src/prompts.py`) — add guidance: a
+      message implying the customer wants to add/change/redo something
+      about an order they believe is already placed → `gift_request`, not
+      `out_of_scope`.
+- [x] `GIFT_PICKER_INSTRUCTIONS` (`src/prompts.py`) — add: if the
+      customer's message implies they think they're modifying a
+      previously placed order, say plainly that a placed order can't be
+      modified and this will be treated as a new order, then continue
+      helping normally (search/suggest/propose as usual) — a redirect
+      into the same flow every other `gift_request` already gets, not a
+      dead end.
+- [ ] **Left as a default, not a full decision — flagged as such:** the
+      Gift-Picker's can't-modify reply is phrasing-based only, not
+      verified against a real order — it reacts to how the customer
+      describes their situation, not an actual DB lookup. Works
+      identically whether it's the same thread, a new thread, or weeks
+      later, and needs nothing from Phase 3.8's schema to function. A
+      DB-backed version (a read-only tool querying `orders` by
+      `phone_number`, so the reply can reference the actual order
+      ref/date instead of just trusting the customer's framing) would be
+      more accurate but needs a new tool — not built here; an upgrade
+      path if the phrasing-only version turns out too easily fooled or
+      too generic in practice.
+- [ ] **Explicitly out of scope for this phase:** cancellation-shaped
+      requests get no routing change here — they fall through to
+      whatever the Intent Router already does today (most likely
+      `out_of_scope`), same as before this phase. Not addressed because
+      "place a new order" is bad advice for someone trying to cancel, and
+      Kapruka has no cancellation capability to route them toward either
+      — that needs its own design, not a default made in passing here.
+
+### Verification checklist
+- [x] Live test: "can you change the delivery date on my order" →
+      `gift_request`; Gift-Picker gives the can't-modify explanation, then
+      proceeds to help normally. **Verified live** (fresh thread, real
+      Gemini + real graph, no checkout ever reached so no financial-action
+      risk): reply was "I'm unable to modify the delivery date or details
+      of an already placed order... However, if you'd like to place a new
+      order or pick out a new gift, I'd be happy to help! Who are you
+      shopping for..." — exactly the shape the plan called for, not a dead
+      end.
+- [x] Boundary check, same style as Phase 1's own `out_of_scope`/
+      `chitchat` adversarial tests: a handful of adjacent modification
+      phrasings classified as `gift_request` correctly, not `out_of_scope`.
+      **Verified live** via `classify_intent` directly: "can you change the
+      delivery date on my order," "I want to add something to my order,"
+      "can you fix my order" all → `gift_request`. Also confirmed no
+      regression on the adjacent case this phase deliberately leaves
+      alone: "I want to cancel my order" still → `return_item`, and a
+      genuine `track_order` message was unaffected.
+- [x] Confirm this behaves the same in a brand-new thread as in the
+      original one — since the reply depends on neither chat history nor
+      a DB lookup, this should hold automatically, but worth checking
+      live rather than assuming. **Verified live**: the test above used a
+      brand-new thread (no prior checkout in that session) and produced
+      the correct behavior, confirming the phrasing-only design doesn't
+      depend on a real preceding order actually existing in that thread.
+## Phase 4 — Chat-agent identity: decouple thread from phone number, new-chat detection, history compaction (built and verified live 2026-09-28)
+
+**Problem being fixed:** everything so far assumes a WhatsApp-shaped
+integration — `session_identity` collapses `thread_id = user_id =
+session_id = phone_number`, so one customer has exactly one conversation,
+forever, with no concept of "starting over." Moving to a normal chat-agent
+interface (not WhatsApp) means the client can own conversation boundaries
+the way Claude.ai/ChatGPT's own "New Chat" button already does — there's
+no reason left to guess session boundaries the way a phone-number-only
+integration would have to.
+
+**Decision:** separate customer identity from conversation identity.
+`phone_number` stays permanent and keeps keying every piece of durable
+data (`recipients`, `orders`, `order_products` from Phase 3.8) — nothing
+about that changes. `thread_id` becomes its own value: client-supplied
+when continuing a chat, freshly generated when absent. History compaction
+after a completed order (discussed alongside this) is no longer the
+primary defense against unbounded growth — the New Chat boundary is —
+it becomes a narrower safety net for customers who keep talking in the
+same thread indefinitely instead.
+
+### Decouple `thread_id` from `phone_number`
+- [x] `session_identity(phone_number, thread_id)` (`src/session.py`) —
+      `user_id`/`session_id` stay tied to `phone_number` (customer
+      identity, unaffected); `thread_id` becomes an independent parameter
+      instead of being derived from `phone_number`.
+- [x] `run_turn(phone_number, message, thread_id=None)` (`src/pipeline.py`)
+      — when `thread_id` is absent, generates a new one (e.g. `uuid4()`)
+      before building `session_identity`, and returns the resolved
+      `thread_id` alongside the reply text so the caller can persist and
+      reuse it on the next call. This is the actual "if thread_id does not
+      arrive, it's a new chat" mechanism — everything else in this phase
+      exists to support or exercise it.
+
+### New `threads` table — not named in the request, but needed to make this real
+- [x] `src/db/schema.sql`: `thread_id TEXT PRIMARY KEY`, `phone_number
+      TEXT NOT NULL`, `created_at TIMESTAMPTZ NOT NULL DEFAULT now()`,
+      `last_active_at TIMESTAMPTZ NOT NULL DEFAULT now()`. Without this,
+      there's no way to answer "show this customer their past chats" at
+      all — `AsyncPostgresSaver` only knows about `thread_id`s, not which
+      customer any of them belong to. `last_active_at` updated on every
+      turn for that thread; a new row written only the first time a given
+      `thread_id` is seen (i.e., exactly when `run_turn` had to generate
+      one), not on every turn. **Implemented as one upsert**
+      (`src/db/threads.py::touch_thread`,
+      `INSERT ... ON CONFLICT (thread_id) DO UPDATE SET last_active_at = now()`)
+      rather than two conditional branches — satisfies both described
+      behaviors in a single statement and is also robust to a client
+      supplying a `thread_id` we never actually issued.
+- [x] Flagging, not building yet: an actual "list my past chats" surface
+      is possible once this table exists, but isn't part of this phase.
+
+### `main.py` — hardcoded placeholder, not the real mechanism
+- [x] The console entry point has no way to simulate "a client starting a
+      new chat," so a second constant, `THREAD_ID`, sits alongside the
+      existing `PHONE_NUMBER` one and gets passed to `run_turn` every
+      loop iteration — keeps local dev/testing continuous across restarts
+      instead of generating a fresh thread every run. The real behavior
+      (a caller omits `thread_id`, gets a new one back; supplies one,
+      continues that chat) is only meaningfully exercised once Phase 7's
+      FastAPI webhook exists and a real caller can choose to pass or omit
+      it per request — not something the console alone can demonstrate
+      end-to-end.
+
+### History compaction after a completed order
+- [x] Right after `complete_order` succeeds — as its own step, not
+      sharing `complete_order`'s own transaction, kept deliberately
+      decoupled so a compaction failure can never touch the one
+      irreversible action in this codebase — replace that thread's
+      checkpointed message history with a short summary (products, order
+      ref, delivery city/date), not append to it. An additive version
+      would keep all the storage cost and none of the benefit.
+- [x] Fold `Cart["notes"]` (and Kapruka's own `gift_message` field, if
+      that ends up wired in — see Phase 3.8's own flagged gap) into the
+      summary text, since neither has anywhere else to live once the raw
+      messages that contained them are gone. (`gift_message` itself isn't
+      folded in — `checkout_info` doesn't carry it at all yet, nothing to
+      fold until Phase 3.8's flagged gap actually gets wired up.)
+- [x] **Mechanism — checked against the pinned versions, not just
+      recalled from docs:** delete the thread's checkpoints, then write
+      one fresh checkpoint into the same `thread_id` holding the summary
+      and the already-cleared state. Two calls:
+      - `AsyncPostgresSaver.adelete_thread(thread_id)` — confirmed present
+        and implemented in the pinned `langgraph-checkpoint-postgres==3.1.2`
+        (read from the installed source). It deletes that thread's rows
+        from `checkpoints`, `checkpoint_blobs` and `checkpoint_writes`,
+        which is what actually reclaims storage.
+      - `graph.aupdate_state(config, {"messages": [summary], ...},
+        as_node=<a real node name>)` — writes the fresh checkpoint.
+        Exercised against the pinned `langgraph==1.2.11` with an
+        in-memory saver on a small stand-in graph: after the delete the
+        thread was empty, after the reseed it held only the summary, and
+        the next turn saw the summary plus the new message and nothing
+        else.
+- [x] **Was unverified, now resolved — the two things flagged to check in
+      a spike before building on this:** (1) **Verified live against the
+      real orchestrator and real Neon** (not just the stand-in
+      graph/in-memory-saver spike above): built a genuine 2-turn thread
+      (4 messages) via `run_turn`, called `compact_thread` directly with a
+      fabricated summary (never a real `create_order`), confirmed via
+      `checkpointer.aget_tuple` that exactly 1 message (the summary)
+      remained and `order_summary_for_compaction` was correctly cleared to
+      `None`, then ran one more real turn on that same `thread_id` and
+      confirmed the result held exactly 3 messages (summary + new turn),
+      not the pre-compaction history — `as_node="confirm_agent"` (the node
+      whose turn produces the completed order this summary describes)
+      works against the real subgraph-based orchestrator, no framework
+      surprise here unlike `EphemeralValue`/`InjectedState`'s. (2)
+      Delete-then-reseed is still not atomic — accepted on purpose, same
+      reasoning as originally flagged (order data is already safe in
+      `orders`/`order_products` regardless); `compact_thread` wraps both
+      calls in one try/except that logs on failure rather than swallowing
+      it, **verified directly**: a simulated `adelete_thread` failure was
+      caught and logged without propagating.
+- [x] Since the New Chat boundary now handles the common case, compaction
+      only needs to cover "the same thread keeps going after a purchase"
+      — a narrower, lower-urgency safety net than it would have been as
+      the primary growth mechanism. Worth keeping that framing in mind if
+      it needs to be deprioritized relative to the identity-decoupling
+      work above.
+
+### Explicitly not addressed here, deliberately deferred
+- [x] A UI/endpoint for listing a customer's past threads — the `threads`
+      table makes it possible, building the surface isn't part of this
+      phase.
+- [x] An order abandoned mid-checkout in a thread that's never reopened
+      stays lost — same accepted limitation raised earlier in design
+      discussion, unrelated to anything built here.
+- [x] A customer who never starts a new chat and never completes an order
+      still grows one thread indefinitely — compaction only fires on a
+      completed order, so this case stays open.
+
+### Verification checklist — all verified live 2026-09-28, real Gemini +
+real Neon, test rows/threads cleaned up after (no real `create_order` ever
+fired — compaction was exercised with a fabricated summary string, not a
+completed order)
+- [x] `run_turn` called with no `thread_id` generates one and a matching
+      `threads` row; called again with that same `thread_id` reuses it,
+      updates `last_active_at`, and does not create a duplicate row.
+      **Verified live**: reused the same generated `thread_id` twice for
+      one phone number — one row, `created_at` unchanged,
+      `last_active_at` moved forward 16s to match the second call; a
+      third call with no `thread_id` under the same phone number produced
+      a genuinely new row.
+- [x] Two different `thread_id`s under the same `phone_number` see
+      genuinely independent history — a fact stated in one thread isn't
+      visible from the other. Confirms the decoupling actually changed
+      behavior, not just a signature. **Verified live** directly against
+      `checkpointer.aget_tuple` (not just reply text, which can look
+      identical either way for canned `chitchat`/`out_of_scope` replies):
+      a 2-turn thread held 4 messages; a fresh thread under the same phone
+      number held exactly 2 (its own single turn).
+- [x] A completed order in one thread, followed by compaction, leaves
+      that thread's next turn seeing the short summary, not the full raw
+      transcript — checked directly against the stored checkpoint, not
+      just "the reply looked right." **Verified live** (see the
+      compaction section above for the full detail): 4 messages -> 1
+      (summary) -> 3 (summary + next real turn).
+- [x] A forced compaction failure (test only) does not affect the
+      already-completed order — `orders`/`order_products` rows exist and
+      are correct regardless of whether compaction itself succeeded.
+      **Verified directly**: a simulated `adelete_thread` exception inside
+      `compact_thread` was caught and logged, never propagated — and
+      since compaction only ever runs as a step strictly after
+      `complete_order`'s own transaction has already committed, there is
+      no code path by which a compaction failure could reach back and
+      touch `orders`/`order_products` regardless.
+
+## Phase 5 — Track-order branch
 
 - [ ] Order-number extraction (ask if missing) → `kapruka_track_order` →
       format reply
 
-## Phase 5 — Return-item branch
+## Phase 6 — Return-item branch
 
 - [ ] Fallback response only — no MCP tool exists for this, don't build one
 
-## Phase 6 — Wire the full graph + end-to-end test
+## Phase 7 — Wire the full graph + end-to-end test
 
 - [ ] FastAPI webhook → Entry → Intent Router → the five branches
 - [ ] Manually test all five intents through the real webhook, not just

@@ -13,6 +13,14 @@ from src.pipeline import run_turn
 sys.stdout.reconfigure(encoding="utf-8")
 
 PHONE_NUMBER = "+94_console_dev"
+# Phase 4: run_turn's real "new chat" mechanism is a caller omitting
+# thread_id and getting one back — the console has no way to simulate "a
+# client starting a new chat," so this hardcoded placeholder just keeps
+# local dev/testing continuous across restarts instead of generating a
+# fresh thread every run. Only meaningfully exercised once the FastAPI
+# webhook exists and a real caller can choose to pass or omit it per
+# request.
+THREAD_ID = "+94_console_dev_thread"
 
 
 async def main() -> None:
@@ -25,7 +33,7 @@ async def main() -> None:
             break
         if not message:
             continue
-        reply = await run_turn(PHONE_NUMBER, message)
+        reply, _ = await run_turn(PHONE_NUMBER, message, THREAD_ID)
         print(f"bot> {reply}\n")
 
 

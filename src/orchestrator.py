@@ -193,6 +193,14 @@ class ConciergeState(TypedDict, total=False):
     # with is_confirmation on the customer's NEXT raw reply — the one
     # deterministic gate in the whole pipeline.
     awaiting_final_yes: Optional[bool]
+    # Phase 4: set by complete_order (src/checkout/flow.py) on success;
+    # read directly off ainvoke's return value by src/pipeline.py::run_turn
+    # (not re-read from a later state fetch) right after the graph
+    # invocation that set it returns, to trigger post-order history
+    # compaction as a separate step. Cleared back to None by the
+    # compaction reseed itself, so a later unrelated turn never sees a
+    # stale value.
+    order_summary_for_compaction: Optional[str]
 
 
 def _route_from_start(state: ConciergeState) -> str:
