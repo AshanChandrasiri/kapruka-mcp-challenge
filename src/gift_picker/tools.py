@@ -89,10 +89,20 @@ def propose_cart(
     still narrowing down options, use suggest_products and ask a follow-up
     instead.
 
-    Each item dict must use the key `product_id` (NOT `id` — see
-    suggest_products for the exact-case, no-retyping rule), plus a plain
-    `price` number (never a nested price object) and whatever name info you
-    have.
+    Each item dict is ONE ROW PER DISTINCT PRODUCT (never repeat the same
+    product_id as separate entries for multiple units — use `quantity`
+    instead) and must include:
+    - `product_id` (NOT `id` — see suggest_products for the exact-case,
+      no-retyping rule)
+    - `name`
+    - `price`: a plain number per unit (never a nested price object)
+    - `quantity`: a plain integer, defaulting to 1 if the customer didn't
+      say otherwise — never split multiple units of the same product into
+      separate items
+    - `url` and `image_url`: copy these forward from whatever
+      suggest_products/kapruka_get_product call you already made for this
+      product this conversation — don't drop them just because a few turns
+      passed since you looked the product up.
 
     Cart-only — no delivery_city/delivery_date here. Delivery details are
     gathered later, once the customer has actually approved this cart

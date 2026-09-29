@@ -946,16 +946,771 @@ Confirm Agent `dynamic_prompt` cancellation-mid-loop fix, both detailed in
 their respective sections above) — the run that finally succeeded
 end-to-end is the one summarized here.
 
-## Phase 4 — Track-order branch
+## Phase 3.7 — Fold the deterministic confirm gate into `confirm_agent` itself (code complete 2026-09-27, live verification still pending)
+
+**Problem being fixed:** Phase 3.6 ended up with two nodes doing what's
+really one job. `check_final_confirmation` exists purely to run
+`is_confirmation` on the raw reply before the real Confirm Agent ever gets
+a turn, and `_route_from_start` has to branch on `awaiting_final_yes` just
+to pick between the two node names. That's a whole extra node and a whole
+extra conditional-edge branch for what's really a two-line check.
+
+**Decision:** the check moves inside `confirm_agent`'s own function, as
+plain code that runs before the underlying compiled agent is ever invoked
+— not something the LLM decides, same deterministic keyword check as
+before, just relocated, not weakened. `check_final_confirmation` and
+`_route_after_final_confirmation_check` are retired; `_route_from_start`
+loses the `awaiting_final_yes` branch entirely.
+
+- [x] The `confirm_agent` node stops being the compiled agent embedded
+      directly (the pattern Phase 3.6 used, matching the Gift-Picker/
+      Checkout Info Agent) — it becomes a wrapping function,
+      `_run_confirm_agent`, same shape as Phase 1's `_run_intent_router`:
+      - Checks `awaiting_final_yes` first. If set, runs `is_confirmation`
+        on the raw reply directly — no call to the underlying LLM agent
+        at all on this branch.
+      - Pass → calls `complete_order` and returns its result directly —
+        identical to what `check_final_confirmation` already did, just
+        from inside this function instead of a separate node.
+      - Fail → clears `awaiting_final_yes` to `False`, then falls through
+        in the same function call to invoke the actual compiled
+        `confirm_agent` — no extra graph hop needed, since it's now
+        sequential code in one function rather than two nodes connected
+        by an edge.
+      - `awaiting_final_yes` false or unset → skips the check entirely,
+        goes straight to the compiled agent — covers `enter_confirm`'s own
+        first entry, where it's always `False`.
+- [x] `_route_from_start`'s `stage == "confirm"` branch drops the
+      `awaiting_final_yes` check — always routes to `confirm_agent` (the
+      new wrapper) regardless of that flag; the flag is only read inside
+      the wrapper now, not at the routing layer.
+- [x] `_route_after_confirm` (the one remaining post-node router) picks up
+      `_route_after_final_confirmation_check`'s `stage is None → END`
+      check as its first condition, ahead of its existing
+      `handoff_reason`/`relay_confirm` checks — needed since the
+      wrapper's fast path can now itself produce `stage: None` (via
+      `complete_order`) on the same node that also handles the slow,
+      agentic path. `check_final_confirmation` and
+      `_route_after_final_confirmation_check` are removed once this is
+      folded in — nothing else calls either.
+- [x] Net effect: one node instead of two for the entire confirm stage,
+      one fewer conditional-edge branch in `_route_from_start`. The
+      actual safety property is unchanged — `is_confirmation` still runs
+      as plain code, still runs before any LLM call on that turn,
+      `complete_order` still has exactly one call site (now inside
+      `_run_confirm_agent` instead of `_check_final_confirmation`) — only
+      where the check physically lives moves, not what it does or when it
+      runs relative to the agent.
+
+**Explicitly not part of this phase, flagged rather than decided:** a
+second, narrow, tool-less classifier for replies that fail
+`is_confirmation` but are still plausibly a "yes" in different words (e.g.
+"great, let's do this") was discussed as a follow-on — not included here.
+As things stand, that class of reply still falls through to the full
+Confirm Agent, which re-engages and re-arms the gate on its own judgment,
+same as any other non-matching reply.
+
+- [ ] Verify live: a genuine "yes" while `awaiting_final_yes` is armed
+      still reaches `complete_order` without invoking the compiled Confirm
+      Agent at all this turn (confirms the LLM truly isn't in this call
+      path, not just that the outcome looks the same).
+- [ ] Verify live: a non-matching reply while armed still correctly falls
+      through to the real agent in the same turn, same behavior as Phase
+      3.6's own equivalent test.
+- [ ] Verify live: `enter_confirm`'s first-entry turn (`awaiting_final_yes`
+      freshly `False`) is unaffected — still reaches the real agent
+      directly, same as today.
+
+## Phase 3.8 — Order persistence: `orders`/`order_products` schema, cart items carry product + image URLs (built and verified live 2026-09-27)
+
+**Found while implementing, not anticipated in the plan:** the live
+`orders` table already had 1 real row (`id=1`, `kapruka_order_ref
+ORD-20260927-CG7A`, `phone_number '+94_console_dev'`, created
+2026-09-27) — a real `kapruka_create_order` call was made at some point
+outside this session (this phase's own migration is destructive —
+`DROP COLUMN items`/`product_summary` — so this was checked directly
+before writing any migration SQL, not assumed empty the way Phase 0 found
+it). Flagged and confirmed with the customer before applying — explicit
+go-ahead given to drop that row's `items`/`product_summary` data rather
+than backfill it; the row itself (`id=1`) was left in place, just with
+those two now-dropped columns' data gone.
+
+**Problem being fixed:** right now, a completed order's data exists in two
+places, both fragile: the `checkout_url` shown to the customer once in
+`complete_order`'s reply text (never persisted — if that message is lost,
+so is the payment link), and a single JSONB blob in the existing `orders`
+table (`items`, `product_summary`) with no per-product detail, no pricing
+breakdown, and no way to look anything up without a customer supplying
+context the bot would otherwise have to pull from message history. Phase 4
+needs a `phone_number` → order lookup that doesn't depend on history at
+all — this phase is what makes that possible.
+
+**Decision:** extend the existing `orders` table (not a new, differently
+named table — `order` is a reserved SQL keyword and would need quoting
+everywhere) with the fields `complete_order` already has on hand but
+doesn't currently save, add a new `order_products` table for per-item
+detail, and align every new column name with the field names
+`checkout_info`/`create_order` already use — `sender_name` (not `from`,
+also reserved), `delivery_fee` (not `delivery_price` — matches Kapruka's
+own response field), `delivery_address`, `delivery_city` — so `save_order`
+needs no translation layer between what it already has and what it writes.
+
+### `orders` table changes (`src/db/schema.sql`)
+- [x] Add columns: `payment_url TEXT`, `payment_url_expires_at TIMESTAMPTZ`,
+      `items_total NUMERIC`, `delivery_fee NUMERIC`, `addons_total NUMERIC`
+      (Kapruka's real response splits the total into these three plus
+      `grand_total` — the existing `total_amount` column already holds
+      `grand_total`; storing all three components rather than just
+      `delivery_fee` alone means the numbers can be reconciled later
+      instead of dropping `addons_total` silently), `currency TEXT`,
+      `delivery_address TEXT`, `recipient_name TEXT`, `recipient_phone
+      TEXT`, `sender_name TEXT`.
+- [x] Rename `kapruka_order_id` → `kapruka_order_ref`, matching
+      `order_result.get("order_ref")`'s own field name exactly — same
+      guarded, idempotent migration pattern already used for
+      `owner_contact` → `phone_number` in this same file
+      (`DO $$ ... IF EXISTS ... THEN ALTER TABLE ... RENAME COLUMN ...`).
+- [x] Drop `items` (JSONB) and `product_summary` — both fully superseded
+      by `order_products` below; keeping either would be a second source
+      of truth that could silently drift from the real per-product rows.
+- [x] `phone_number`, `status`, `delivery_city`, `delivery_date`,
+      `total_amount`, `created_at` — already exist, unchanged.
+
+### New `order_products` table
+- [x] `id SERIAL PRIMARY KEY`, `order_id INTEGER REFERENCES orders(id)`,
+      `kapruka_product_id TEXT`, `product_name TEXT`, `product_url TEXT`,
+      `product_image_url TEXT`, `unit_price NUMERIC`, `quantity INTEGER`,
+      `created_at TIMESTAMPTZ NOT NULL DEFAULT now()`. Index on `order_id`.
+
+### Cart items need to carry `url`/`image_url` through — they currently don't
+- [x] `propose_cart`'s docstring (`src/gift_picker/tools.py`) only requires
+      `product_id`, a plain `price`, and "whatever name info you have" per
+      item — it never mentions `url` or `image_url`, even though
+      `suggest_products`'s own `ProductSuggestion` schema already captures
+      both a step earlier in the same conversation. Update the docstring
+      to explicitly require both fields per cart item, same tightened,
+      explicit-example style already used for the `product_id` exact-case
+      rule — a docstring here is guidance, not a guarantee, per this
+      project's own established finding (the price-shape bug, the
+      product_id re-casing bug), so vague wording has a known track record
+      of being followed loosely.
+- [ ] **Residual risk worth flagging, not glossing over:** unlike
+      `product_id` (trivially copy-paste-able), `url`/`image_url` require
+      the model to still be carrying a value forward from an earlier
+      `suggest_products`/`kapruka_get_product` call, potentially several
+      turns back. `GIFT_PICKER_INSTRUCTIONS`'s existing "never describe a
+      product without having looked it up" rule should make this mostly
+      self-satisfying, but it hasn't been exercised in a longer, multi-turn
+      conversation the way the immediate lookup-then-cart pattern already
+      has — worth a dedicated live test, not assumed to just work because
+      the shorter-conversation tests passed.
+
+### Fix the hardcoded quantity bug, found while designing this phase
+- [x] `create_order` (`src/checkout/order.py`) currently sends
+      `"quantity": 1` for every cart item unconditionally, regardless of
+      what's actually in `cart["items"]`:
+      `{"product_id": item["product_id"], "quantity": 1}`. A `quantity`
+      column on `order_products` is meaningless while this stays broken —
+      fix to `item.get("quantity", 1)`.
+- [x] **Real design fork, not just a one-line change — `propose_cart`'s
+      docstring has never said anything about quantity at all** (checked
+      directly, not assumed). Two different cart shapes are both
+      consistent with that silence: the Gift-Picker could be expected to
+      emit one row per unit (two chocolates = two identical `product_id`
+      entries) or one row per distinct product with an explicit
+      `quantity` field. Decide which before writing `finalize_checkout_info`/
+      `order_products`-insert logic that assumes one or the other — the
+      docstring update above should make the chosen shape explicit rather
+      than leaving it to be inferred. **Decided: one row per distinct
+      product_id, explicit `quantity` field** — matches
+      `kapruka_create_order`'s own `{product_id, quantity}` cart-item shape
+      (which already had a `quantity` field sitting unused/hardcoded), and
+      avoids `order_products` carrying N identical rows for N units of the
+      same product.
+
+### `save_order` rewrite (`src/checkout/order.py`)
+- [x] Becomes a two-table insert: one `orders` row (`checkout_info`'s
+      fields map 1:1 now that names match, plus `order_result`'s
+      `summary.*`/`checkout_url`/`order_ref`), then one `order_products`
+      row per cart item. Run inside a single transaction — a partial
+      failure leaving an `orders` row with no matching `order_products`
+      rows is a new failure mode a two-table insert introduces that the
+      old single-table version never had. (`pool.connection()`'s own
+      context manager already commits-on-clean-exit/rolls-back-on-exception
+      per connection, so both inserts sharing one `async with pool.connection()`
+      block gets this for free — no explicit `BEGIN`/`COMMIT` needed.)
+- [x] `payment_url_expires_at` computed at insert time as
+      `now() + interval '60 minutes'` — Kapruka's own guest-checkout
+      pay-link window, confirmed from the tool's own documented behavior,
+      not guessed.
+- [x] `summary.delivery_fee`/`summary.addons_total` read defensively
+      (`.get(...)`, allow null) — this project's own build log only
+      explicitly confirmed `summary.grand_total` against a live response
+      so far (Phase 3); treat the other two the same cautious way
+      `_item_price` already handles inconsistent price shapes elsewhere,
+      rather than assuming the tool's documented schema and the live
+      response agree on every field.
+
+### Not this phase's job — context for why this phase exists
+- [ ] The actual track-order intent handler (order-number extraction,
+      `kapruka_track_order`, formatting a reply) stays Phase 4's work.
+      This phase only makes the lookup possible: `phone_number` →
+      `orders`, joined to `order_products` for per-item detail, in place
+      of pulling that context from message history.
+
+### Verification checklist — migration applied live 2026-09-27 (existing
+`orders` row id=1 predates this phase, left in place with the now-dropped
+columns' data gone, per explicit go-ahead — see the found-live note above)
+- [x] `schema.sql`'s migration re-applies cleanly a second time against the
+      live Neon instance (idempotent) — same bar the existing
+      `owner_contact` migration already meets. **Verified live**: ran
+      `scripts/check_db.py` twice in a row against the real Neon instance,
+      no errors either time.
+- [x] Rewritten `save_order` tested directly against a fabricated
+      `order_result` (not a live Kapruka call — same "never fire a real
+      create_order in dev" boundary as every other checkout test in this
+      codebase) confirms both tables populate correctly, including
+      `product_url`/`product_image_url` on every `order_products` row.
+      **Verified live**: a fabricated 2-item cart (`quantity` 2 and 1,
+      default) round-tripped through the real `save_order` against the
+      real Neon instance — `orders` row had every field populated
+      correctly (`items_total`/`delivery_fee`/`addons_total`/`currency`
+      from `summary`, all six `checkout_info` fields, `payment_url`,
+      correct `kapruka_order_ref`), both `order_products` rows had correct
+      `product_url`/`product_image_url`/`unit_price`/`quantity`. Test rows
+      deleted immediately after (`TEST-VERIFY-3.8`).
+- [x] A cart item with `quantity` > 1 reaches Kapruka's real `quantity`
+      field correctly, not hardcoded `1`. **Verified directly** (not
+      against the live Kapruka MCP call itself, same "never fire a real
+      create_order" boundary): monkeypatched `call_kapruka_tool` to
+      capture `create_order`'s own outgoing params without a network
+      call — a `quantity: 3` item and a quantity-omitted item both
+      produced the correct request shape (`3` and `1`/default,
+      respectively), confirming the hardcode is actually gone, not just
+      the line of code that used to say `1`.
+- [x] `payment_url_expires_at` lands roughly 60 minutes after `created_at`
+      on a real inserted row. **Verified live**: the test row's
+      `payment_url_expires_at` was exactly `created_at + 1:00:00`.
+- [ ] A longer, multi-turn conversation (lookup a product several turns
+      before it's actually added to the cart) still produces a correct
+      `url`/`image_url` on the resulting cart item — the specific residual
+      risk flagged above, not covered by the shorter existing tests. Not
+      run — needs a real multi-turn Gift-Picker/Gemini conversation, not
+      just a DB-layer check; deferred rather than spending live LLM/Kapruka
+      rate-limit budget on it speculatively, same call this project has
+      made before for lower-priority live tests.
+
+## Phase 3.8.1 — Prevent modification of a placed order (built and verified live 2026-09-28)
+
+**Problem being fixed:** `complete_order`'s own success path clears
+`stage` to `None` (see Phase 3.6) — so a "can you change my order" message
+arriving right after checkout has nothing left routing it to the Confirm
+Agent. `_route_from_start` only reaches the Confirm Agent when
+`stage == "confirm"`, and that stage is already gone by the time this
+message arrives; it isn't a judgment call the Confirm Agent could make
+even in principle, it's structurally unreachable. The message falls
+through to the Intent Router instead, same as any fresh turn — and none
+of the five existing intents (`gift_request` / `track_order` /
+`return_item` / `chitchat` / `out_of_scope`) obviously fit "modify a
+just-placed order." Left unhandled, it risks landing on `out_of_scope`,
+declining someone who still wants help.
+
+**Decision:** Kapruka has no modify tool anywhere in its MCP surface — so
+any change to a placed order is necessarily a brand-new order, which is
+exactly what the Gift-Picker already does every day. Reuse it rather than
+building a new stage or node. **Scoped to modification only, for now** —
+cancellation-shaped requests ("cancel my order," "undo my order") are
+explicitly out of scope for this phase, not silently folded in. A
+deliberate scope decision, not an oversight; revisit separately once
+cancellation itself gets designed.
+
+- [x] Intent Router instructions (`src/prompts.py`) — add guidance: a
+      message implying the customer wants to add/change/redo something
+      about an order they believe is already placed → `gift_request`, not
+      `out_of_scope`.
+- [x] `GIFT_PICKER_INSTRUCTIONS` (`src/prompts.py`) — add: if the
+      customer's message implies they think they're modifying a
+      previously placed order, say plainly that a placed order can't be
+      modified and this will be treated as a new order, then continue
+      helping normally (search/suggest/propose as usual) — a redirect
+      into the same flow every other `gift_request` already gets, not a
+      dead end.
+- [ ] **Left as a default, not a full decision — flagged as such:** the
+      Gift-Picker's can't-modify reply is phrasing-based only, not
+      verified against a real order — it reacts to how the customer
+      describes their situation, not an actual DB lookup. Works
+      identically whether it's the same thread, a new thread, or weeks
+      later, and needs nothing from Phase 3.8's schema to function. A
+      DB-backed version (a read-only tool querying `orders` by
+      `phone_number`, so the reply can reference the actual order
+      ref/date instead of just trusting the customer's framing) would be
+      more accurate but needs a new tool — not built here; an upgrade
+      path if the phrasing-only version turns out too easily fooled or
+      too generic in practice.
+- [ ] **Explicitly out of scope for this phase:** cancellation-shaped
+      requests get no routing change here — they fall through to
+      whatever the Intent Router already does today (most likely
+      `out_of_scope`), same as before this phase. Not addressed because
+      "place a new order" is bad advice for someone trying to cancel, and
+      Kapruka has no cancellation capability to route them toward either
+      — that needs its own design, not a default made in passing here.
+
+### Verification checklist
+- [x] Live test: "can you change the delivery date on my order" →
+      `gift_request`; Gift-Picker gives the can't-modify explanation, then
+      proceeds to help normally. **Verified live** (fresh thread, real
+      Gemini + real graph, no checkout ever reached so no financial-action
+      risk): reply was "I'm unable to modify the delivery date or details
+      of an already placed order... However, if you'd like to place a new
+      order or pick out a new gift, I'd be happy to help! Who are you
+      shopping for..." — exactly the shape the plan called for, not a dead
+      end.
+- [x] Boundary check, same style as Phase 1's own `out_of_scope`/
+      `chitchat` adversarial tests: a handful of adjacent modification
+      phrasings classified as `gift_request` correctly, not `out_of_scope`.
+      **Verified live** via `classify_intent` directly: "can you change the
+      delivery date on my order," "I want to add something to my order,"
+      "can you fix my order" all → `gift_request`. Also confirmed no
+      regression on the adjacent case this phase deliberately leaves
+      alone: "I want to cancel my order" still → `return_item`, and a
+      genuine `track_order` message was unaffected.
+- [x] Confirm this behaves the same in a brand-new thread as in the
+      original one — since the reply depends on neither chat history nor
+      a DB lookup, this should hold automatically, but worth checking
+      live rather than assuming. **Verified live**: the test above used a
+      brand-new thread (no prior checkout in that session) and produced
+      the correct behavior, confirming the phrasing-only design doesn't
+      depend on a real preceding order actually existing in that thread.
+## Phase 4 — Chat-agent identity: decouple thread from phone number, new-chat detection, history compaction (built and verified live 2026-09-28)
+
+**Problem being fixed:** everything so far assumes a WhatsApp-shaped
+integration — `session_identity` collapses `thread_id = user_id =
+session_id = phone_number`, so one customer has exactly one conversation,
+forever, with no concept of "starting over." Moving to a normal chat-agent
+interface (not WhatsApp) means the client can own conversation boundaries
+the way Claude.ai/ChatGPT's own "New Chat" button already does — there's
+no reason left to guess session boundaries the way a phone-number-only
+integration would have to.
+
+**Decision:** separate customer identity from conversation identity.
+`phone_number` stays permanent and keeps keying every piece of durable
+data (`recipients`, `orders`, `order_products` from Phase 3.8) — nothing
+about that changes. `thread_id` becomes its own value: client-supplied
+when continuing a chat, freshly generated when absent. History compaction
+after a completed order (discussed alongside this) is no longer the
+primary defense against unbounded growth — the New Chat boundary is —
+it becomes a narrower safety net for customers who keep talking in the
+same thread indefinitely instead.
+
+### Decouple `thread_id` from `phone_number`
+- [x] `session_identity(phone_number, thread_id)` (`src/session.py`) —
+      `user_id`/`session_id` stay tied to `phone_number` (customer
+      identity, unaffected); `thread_id` becomes an independent parameter
+      instead of being derived from `phone_number`.
+- [x] `run_turn(phone_number, message, thread_id=None)` (`src/pipeline.py`)
+      — when `thread_id` is absent, generates a new one (e.g. `uuid4()`)
+      before building `session_identity`, and returns the resolved
+      `thread_id` alongside the reply text so the caller can persist and
+      reuse it on the next call. This is the actual "if thread_id does not
+      arrive, it's a new chat" mechanism — everything else in this phase
+      exists to support or exercise it.
+
+### New `threads` table — not named in the request, but needed to make this real
+- [x] `src/db/schema.sql`: `thread_id TEXT PRIMARY KEY`, `phone_number
+      TEXT NOT NULL`, `created_at TIMESTAMPTZ NOT NULL DEFAULT now()`,
+      `last_active_at TIMESTAMPTZ NOT NULL DEFAULT now()`. Without this,
+      there's no way to answer "show this customer their past chats" at
+      all — `AsyncPostgresSaver` only knows about `thread_id`s, not which
+      customer any of them belong to. `last_active_at` updated on every
+      turn for that thread; a new row written only the first time a given
+      `thread_id` is seen (i.e., exactly when `run_turn` had to generate
+      one), not on every turn. **Implemented as one upsert**
+      (`src/db/threads.py::touch_thread`,
+      `INSERT ... ON CONFLICT (thread_id) DO UPDATE SET last_active_at = now()`)
+      rather than two conditional branches — satisfies both described
+      behaviors in a single statement and is also robust to a client
+      supplying a `thread_id` we never actually issued.
+- [x] Flagging, not building yet: an actual "list my past chats" surface
+      is possible once this table exists, but isn't part of this phase.
+
+### `main.py` — hardcoded placeholder, not the real mechanism
+- [x] The console entry point has no way to simulate "a client starting a
+      new chat," so a second constant, `THREAD_ID`, sits alongside the
+      existing `PHONE_NUMBER` one and gets passed to `run_turn` every
+      loop iteration — keeps local dev/testing continuous across restarts
+      instead of generating a fresh thread every run. The real behavior
+      (a caller omits `thread_id`, gets a new one back; supplies one,
+      continues that chat) is only meaningfully exercised once Phase 7's
+      FastAPI webhook exists and a real caller can choose to pass or omit
+      it per request — not something the console alone can demonstrate
+      end-to-end.
+
+### History compaction after a completed order
+- [x] Right after `complete_order` succeeds — as its own step, not
+      sharing `complete_order`'s own transaction, kept deliberately
+      decoupled so a compaction failure can never touch the one
+      irreversible action in this codebase — replace that thread's
+      checkpointed message history with a short summary (products, order
+      ref, delivery city/date), not append to it. An additive version
+      would keep all the storage cost and none of the benefit.
+- [x] Fold `Cart["notes"]` (and Kapruka's own `gift_message` field, if
+      that ends up wired in — see Phase 3.8's own flagged gap) into the
+      summary text, since neither has anywhere else to live once the raw
+      messages that contained them are gone. (`gift_message` itself isn't
+      folded in — `checkout_info` doesn't carry it at all yet, nothing to
+      fold until Phase 3.8's flagged gap actually gets wired up.)
+- [x] **Mechanism — checked against the pinned versions, not just
+      recalled from docs:** delete the thread's checkpoints, then write
+      one fresh checkpoint into the same `thread_id` holding the summary
+      and the already-cleared state. Two calls:
+      - `AsyncPostgresSaver.adelete_thread(thread_id)` — confirmed present
+        and implemented in the pinned `langgraph-checkpoint-postgres==3.1.2`
+        (read from the installed source). It deletes that thread's rows
+        from `checkpoints`, `checkpoint_blobs` and `checkpoint_writes`,
+        which is what actually reclaims storage.
+      - `graph.aupdate_state(config, {"messages": [summary], ...},
+        as_node=<a real node name>)` — writes the fresh checkpoint.
+        Exercised against the pinned `langgraph==1.2.11` with an
+        in-memory saver on a small stand-in graph: after the delete the
+        thread was empty, after the reseed it held only the summary, and
+        the next turn saw the summary plus the new message and nothing
+        else.
+- [x] **Was unverified, now resolved — the two things flagged to check in
+      a spike before building on this:** (1) **Verified live against the
+      real orchestrator and real Neon** (not just the stand-in
+      graph/in-memory-saver spike above): built a genuine 2-turn thread
+      (4 messages) via `run_turn`, called `compact_thread` directly with a
+      fabricated summary (never a real `create_order`), confirmed via
+      `checkpointer.aget_tuple` that exactly 1 message (the summary)
+      remained and `order_summary_for_compaction` was correctly cleared to
+      `None`, then ran one more real turn on that same `thread_id` and
+      confirmed the result held exactly 3 messages (summary + new turn),
+      not the pre-compaction history — `as_node="confirm_agent"` (the node
+      whose turn produces the completed order this summary describes)
+      works against the real subgraph-based orchestrator, no framework
+      surprise here unlike `EphemeralValue`/`InjectedState`'s. (2)
+      Delete-then-reseed is still not atomic — accepted on purpose, same
+      reasoning as originally flagged (order data is already safe in
+      `orders`/`order_products` regardless); `compact_thread` wraps both
+      calls in one try/except that logs on failure rather than swallowing
+      it, **verified directly**: a simulated `adelete_thread` failure was
+      caught and logged without propagating.
+- [x] Since the New Chat boundary now handles the common case, compaction
+      only needs to cover "the same thread keeps going after a purchase"
+      — a narrower, lower-urgency safety net than it would have been as
+      the primary growth mechanism. Worth keeping that framing in mind if
+      it needs to be deprioritized relative to the identity-decoupling
+      work above.
+
+### Explicitly not addressed here, deliberately deferred
+- [x] A UI/endpoint for listing a customer's past threads — the `threads`
+      table makes it possible, building the surface isn't part of this
+      phase.
+- [x] An order abandoned mid-checkout in a thread that's never reopened
+      stays lost — same accepted limitation raised earlier in design
+      discussion, unrelated to anything built here.
+- [x] A customer who never starts a new chat and never completes an order
+      still grows one thread indefinitely — compaction only fires on a
+      completed order, so this case stays open.
+
+### Verification checklist — all verified live 2026-09-28, real Gemini +
+real Neon, test rows/threads cleaned up after (no real `create_order` ever
+fired — compaction was exercised with a fabricated summary string, not a
+completed order)
+- [x] `run_turn` called with no `thread_id` generates one and a matching
+      `threads` row; called again with that same `thread_id` reuses it,
+      updates `last_active_at`, and does not create a duplicate row.
+      **Verified live**: reused the same generated `thread_id` twice for
+      one phone number — one row, `created_at` unchanged,
+      `last_active_at` moved forward 16s to match the second call; a
+      third call with no `thread_id` under the same phone number produced
+      a genuinely new row.
+- [x] Two different `thread_id`s under the same `phone_number` see
+      genuinely independent history — a fact stated in one thread isn't
+      visible from the other. Confirms the decoupling actually changed
+      behavior, not just a signature. **Verified live** directly against
+      `checkpointer.aget_tuple` (not just reply text, which can look
+      identical either way for canned `chitchat`/`out_of_scope` replies):
+      a 2-turn thread held 4 messages; a fresh thread under the same phone
+      number held exactly 2 (its own single turn).
+- [x] A completed order in one thread, followed by compaction, leaves
+      that thread's next turn seeing the short summary, not the full raw
+      transcript — checked directly against the stored checkpoint, not
+      just "the reply looked right." **Verified live** (see the
+      compaction section above for the full detail): 4 messages -> 1
+      (summary) -> 3 (summary + next real turn).
+- [x] A forced compaction failure (test only) does not affect the
+      already-completed order — `orders`/`order_products` rows exist and
+      are correct regardless of whether compaction itself succeeded.
+      **Verified directly**: a simulated `adelete_thread` exception inside
+      `compact_thread` was caught and logged, never propagated — and
+      since compaction only ever runs as a step strictly after
+      `complete_order`'s own transaction has already committed, there is
+      no code path by which a compaction failure could reach back and
+      touch `orders`/`order_products` regardless.
+
+
+## Phase 5 — Observability (OpenTelemetry: request tracing, per-agent token usage, tool-call visibility)
+
+**Problem being fixed:** none of this codebase currently has any way to
+see a request trace, identify where a turn went wrong, or measure token
+usage per agent or tool call — every diagnosis so far has depended on
+reading console prints or re-running a scenario by hand.
+
+**Decision:** OpenTelemetry, built around reusable shared components so
+every agent (Intent Router, Gift-Picker, Checkout Info Agent, Confirm
+Agent, and the deterministic pipeline) reuses the same setup rather than
+each reinventing it. Rolled out incrementally, not all at once — broken
+into its own numbered sub-phases below (`5.0.0`, `5.0.1`, and more as the
+rollout continues), each independently buildable and verifiable on its
+own rather than one large phase that can only be checked off as a whole.
+
+### Phase 5.0.0 — Observability scaffolding: reusable OpenTelemetry setup, no agent wired in yet (built and verified live 2026-09-29)
+
+**Decision:** build one shared module now, console-output only — no
+Langfuse, no OTLP export, nothing sent anywhere external. Nothing in this
+sub-phase touches an actual agent's code; that's deliberately Phase
+5.0.1's job, kept separate so a problem in the scaffolding and a problem
+in the first real integration aren't debugged at the same time.
+
+- [x] New module, `src/observability.py`:
+      - `configure()` — a `TracerProvider` with a `SimpleSpanProcessor` +
+        `ConsoleSpanExporter` (not `BatchSpanProcessor` — for a
+        console-output-only phase, exporting each span the instant it
+        completes is simpler and more predictable than a batch timer, and
+        avoids depending on an explicit flush for correctness; batching
+        becomes worth it again once a real network destination like
+        Langfuse enters the picture later). Also sets
+        `LANGSMITH_TRACING_MODE=otel` — confirmed directly from the
+        installed `langsmith` package's source (not docs) to route
+        LangChain/LangGraph's own run-tracing through this same
+        `TracerProvider`, entirely locally, no LangSmith account or API
+        key involved.
+      - `flush()` — force-flushes the provider before process exit. Less
+        critical with `SimpleSpanProcessor` than it would be with
+        `BatchSpanProcessor`, but kept as cheap insurance and because it
+        becomes load-bearing again the moment this moves to a batched,
+        networked exporter.
+      - `turn_context(phone_number, thread_id)` — a context manager
+        attaching both as OpenTelemetry baggage, so every span created
+        for the duration of one turn — across whichever agent or tool
+        runs — carries them automatically, with nothing threaded through
+        function signatures. Not exercised by any real span in this
+        sub-phase (no agent is wired in yet); built now so Phase 5.0.1
+        doesn't need to.
+      - `get_tracer()` — one named tracer, used everywhere from here on,
+        instead of each module creating its own.
+- [x] `requirements.txt` additions: `opentelemetry-sdk`,
+      `opentelemetry-api`, `langsmith[otel]` (the LangChain/LangGraph
+      bridge — a local instrumentation shim in this configuration, not a
+      dependency on the LangSmith product). `langsmith` itself stayed at
+      the already-installed `0.12.4` — its OTEL bridge is present there
+      already (confirmed by reading the installed source), no version
+      bump needed; the `[otel]` extra just pulled in the
+      `opentelemetry-exporter-otlp-*` packages (unused until a later
+      sub-phase swaps in a real OTLP destination).
+- [x] `scripts/check_otel.py` — a standalone smoke test, same pattern as
+      Phase 0's `check_llm.py`/`check_mcp.py`/`check_db.py`: calls
+      `configure()`, opens one manual span with a fake attribute, confirms
+      it prints to console. Validates the scaffolding in isolation —
+      whether OpenTelemetry itself is configured correctly — as a
+      separate question from whether the LangChain/LangGraph bridge
+      correctly captures a real agent, which is what Phase 5.0.1 actually
+      tests.
+- [x] Explicitly not done here: no agent's code changes, `main.py` is
+      untouched, no root span exists yet for a real turn. That's Phase
+      5.0.1, not this one.
+
+#### Verification checklist
+- [x] `python scripts/check_otel.py` prints a span to the console with the
+      expected name and attribute — confirms the provider/exporter/bridge
+      configuration works before anything real depends on it. **Verified
+      live**: printed a `check_otel.manual_span` span with
+      `check.fake_attribute="hello-otel"` and, as a bonus early check of
+      `turn_context`/`_BaggageSpanProcessor` (not required by this
+      sub-phase's own scope, but cheap to confirm now rather than wait for
+      5.0.1), correct `phone_number`/`thread_id` baggage attributes on the
+      same span.
+- [x] `LANGSMITH_TRACING_MODE=otel` genuinely makes no network call to any
+      LangSmith endpoint — verify directly (e.g. no outbound request in a
+      network capture, or confirm from the installed package's own logic)
+      rather than trusting the env var's name alone. **Verified two ways**:
+      (1) read `langsmith/client.py`'s source directly — `Client.info`
+      explicitly skips its API call when `tracing_mode == "otel"`, and
+      `Client.__init__`'s otel-setup branch never touches the network
+      either. (2) Live-constructed a real `Client(tracing_mode="otel")`
+      with no `LANGSMITH_API_KEY` set anywhere in this project's `.env` —
+      succeeded with no error, and `.info` returned a local stub
+      (`LangSmithInfo(version='', ...)`), not a fetched response, matching
+      the source-level finding rather than just trusting it. **Also found
+      live, not anticipated in the plan:** if `opentelemetry` isn't
+      actually installed, `langsmith`'s `Client` silently falls BACK to
+      real network-based `"langsmith"` mode instead of failing loudly
+      (confirmed in the installed source's `except ImportError` branch) —
+      a real footgun this project avoided only by installing
+      `opentelemetry-sdk`/`-api` before ever setting `LANGSMITH_TRACING`,
+      not by the mode flag alone.
+
+### Phase 5.0.1 — Wire it into one agent: the Intent Router, verified via `main.py` (built and verified live 2026-09-29 — two genuine bridge limitations found and accepted, see below)
+
+**Problem being fixed:** Phase 5.0.0's scaffolding is unverified against a
+real agent until something actually uses it. Rolling out to all four
+agents at once would make a failure hard to localize — is it the
+scaffolding, the bridge, or something specific to whichever agent broke
+first? Piloting on one agent first isolates that.
+
+**Decision:** the Intent Router, not the Gift-Picker — it's the simplest
+possible case (a single LLM call, zero tools, no ReAct loop, no
+cross-agent handoff), which minimizes what could confound a first result.
+Verification is entirely by reading `main.py`'s console output, matching
+Phase 5.0.0's own "logging only, no dashboard yet" scope — nothing here
+talks to Langfuse.
+
+- [x] `run_turn()` (`src/pipeline.py`) — wrap the existing `ainvoke` call
+      in `get_tracer().start_as_current_span("run_turn", kind=SpanKind.SERVER)`,
+      itself inside `turn_context(phone_number, thread_id)`. `SpanKind.SERVER`
+      specifically matters here, not just as a formality — a console app
+      emits no server-shaped spans otherwise, since nothing else in the
+      process would create one.
+- [x] `main.py` — one call to `observability.configure()` at startup, one
+      call to `observability.flush()` before the process exits.
+- [x] After the Intent Router returns, add the classification result as a
+      manual attribute on the current span (e.g. `trace.get_current_span()
+      .set_attribute("gift.intent", result)`) — this is domain-specific
+      enrichment the auto-instrumentation won't produce on its own, the
+      same pattern used for adding facts onto an already-open span rather
+      than creating a redundant new one.
+- [x] No handoff span in this sub-phase — with only the Intent Router
+      instrumented, there's nothing yet to hand off *to* (canned
+      `chitchat`/`out_of_scope` replies, and `gift_request` is still just
+      a stub downstream). That pattern becomes relevant starting with
+      Phase 5.0.2 or whichever sub-phase extends this to the Gift-Picker.
+- [x] **Genuinely unverified going in, not assumed:** whether
+      `langsmith[otel]`'s bridge correctly captures `create_agent`-as-
+      subgraph-node's LLM call with real Gemini token-usage attributes.
+      The bridge's existence and its local-only `OTEL` mode were
+      confirmed by reading its installed source; whether it correctly
+      understands *this* project's specific LangGraph shape has not been
+      run live. This is the first thing to actually check once this
+      sub-phase runs, not something to take on faith from having read the
+      code. **Answer: yes, and considerably more than hoped** — the bridge
+      doesn't just capture the Intent Router's own LLM call, it
+      auto-instruments the ENTIRE compiled graph for free: every LangGraph
+      node got its own span (`__start__`, `_route_from_start`,
+      `intent_router`, `extract_intent`, `_route_on_intent`,
+      `chitchat_node`/`gift_picker`, the Gift-Picker's own `tools`/`model`/
+      `ChatGoogleGenerativeAI` spans down to individual tool calls like
+      `kapruka_search_products`, `LangGraph`, `concierge_orchestrator`),
+      each carrying real `gen_ai.usage.input_tokens`/`output_tokens`/
+      `total_tokens`, `gen_ai.request.model`, `gen_ai.system`. **But this
+      needed a real bug fix first, not just observation** — see the
+      `bytes`-attribute finding below.
+
+#### Explicitly deferred — the roadmap past this pilot, not built here
+- [ ] Extending the same reusable pieces to the Gift-Picker, Checkout
+      Info Agent, and Confirm Agent — no new reusable code needed, since
+      `turn_context`/`get_tracer` already cover them.
+- [ ] Explicit "handoff" spans at the real orchestrator transition points
+      (`with_gift_picker`→`checkout_info`, `checkout_info`→`confirm`, any
+      `handoff_reason` hand-back) — the auto-instrumentation captures each
+      agent's own internal work but nothing that marks one agent handing
+      control to another; that needs a deliberately added span at each
+      transition, not something that appears for free.
+- [ ] Tool-call enrichment inside each `@tool` function via
+      `trace.get_current_span().set_attribute(...)` — adding attributes
+      to the span the framework already creates for a tool call, not a
+      new span wrapping it.
+- [ ] Manual spans for the non-LangChain deterministic pipeline (the raw
+      MCP client in `src/checkout/mcp_client.py`, DB writes in
+      `save_order`/`get_recipient_profile`, the compaction step) — none
+      of these go through LangChain's callback system, so none of them
+      get instrumented for free the way the agent-layer calls do.
+      Genuine hand-written-span work, not a configuration change.
+- [ ] Proper `span.record_exception()` + `span.set_status(...)` at
+      failure points — the standard OpenTelemetry idiom for marking a
+      span as failed, so "where did it go wrong" is visible to any
+      OTel-compatible viewer without a custom convention to remember.
+      **Sharpened by a live finding in this sub-phase, not just still
+      deferred as originally scoped:** this turns out to be needed for the
+      auto-instrumented bridge spans too, not only the hand-written
+      deterministic-pipeline ones — see the verification checklist below.
+- [ ] Swapping `ConsoleSpanExporter` for an OTLP exporter pointed at a
+      self-hosted Langfuse instance — one exporter line, once there's
+      something worth looking at beyond console output.
+
+#### Verification checklist
+- [x] `main.py` run through a `chitchat` message and a real classification
+      message, console output inspected directly for: a `run_turn` span
+      of `SpanKind.SERVER`, a nested span for the Intent Router's own LLM
+      call, `gen_ai.usage.input_tokens`/`gen_ai.usage.output_tokens` (or
+      whatever the actual attribute names turn out to be — the OTel GenAI
+      semantic conventions are still in Development status as of this
+      writing, so treat exact names as subject to drift, not frozen) on
+      that nested span, and the manually added `gift.intent` attribute.
+      **Verified live** — all present, exactly as named above (not
+      "whatever the names turn out to be": `gen_ai.usage.input_tokens`/
+      `output_tokens`/`total_tokens` matched the anticipated names exactly).
+      **Found and fixed live to get here, not anticipated in the plan:**
+      the langsmith bridge sets `gen_ai.prompt`/`gen_ai.completion` as raw
+      `bytes`, which crashed `ConsoleSpanExporter`'s default JSON
+      serialization and silently dropped every bridge-generated span from
+      console output — only this module's own manually-created `run_turn`
+      span (no bytes attributes) was ever printing. Root-caused via a
+      diagnostic `SpanProcessor.on_end` that inspected each attribute's
+      Python type on a real span, not guessed from the traceback alone.
+      Fixed in `src/observability.py::_console_safe_formatter` (decodes
+      bytes to `str` before delegating to the real `to_json()`) — see that
+      module's own docstring for the full detail.
+- [x] `phone_number`/`thread_id` baggage attributes are present on both
+      the root span and the nested LLM-call span — confirms baggage
+      propagation actually reaches child spans, not just the one it was
+      attached from. **Partially true, verified live, not fully — a real
+      limitation, not a bug left unfixed:** present on the root `run_turn`
+      span (confirmed). NOT present on the langsmith-bridge-generated
+      nested spans — root-caused by directly inspecting
+      `threading.current_thread()` inside the bridge's own span-creation
+      call: `langsmith.Client`'s default `auto_batch_tracing=True` creates
+      those spans from a background `tracing_control_thread_func` thread,
+      which never inherits the calling thread/task's attached
+      `contextvars` baggage context. **A fix was attempted and explicitly
+      rejected, not left untried:** `Client(auto_batch_tracing=False,
+      tracing_mode="otel")` does make spans create on the calling thread
+      (baggage would reach them) — but live-testing it showed it ALSO
+      bypasses the client's own otel-only network guard and fires real
+      authenticated requests at `api.smith.langchain.com` (confirmed via
+      real `401 Unauthorized` errors — a genuine outbound network call,
+      exactly what this whole setup exists to avoid). Judged "no network
+      call, ever" more important than complete baggage coverage, so the
+      default `auto_batch_tracing=True` is kept and this gap is accepted
+      as a documented limitation (see `src/observability.py`'s docstring),
+      not silently worked around.
+- [x] A deliberately broken call (e.g. a bad model name) produces a span
+      that's visibly marked as failed in the console output, not just a
+      Python traceback with no corresponding span-level signal.
+      **Verified live with a real invalid model name — true for this
+      module's own span, not for the bridge's:** the root `run_turn` span
+      correctly got `status_code: ERROR` plus a recorded `exception` event
+      (OTel's own default behavior when an exception exits a
+      `start_as_current_span` block). The actual failing
+      `ChatGoogleGenerativeAI`/`model` spans from the bridge stayed
+      `status_code: OK` — the failure text does land inside their
+      `gen_ai.completion` attribute as unstructured JSON, but the bridge
+      never calls `set_status`/`record_exception` on them. This is a
+      concrete instance of the "Explicitly deferred" `record_exception`/
+      `set_status` item above turning out to matter for the
+      auto-instrumented layer too — not just the deterministic pipeline it
+      was originally scoped for.
+
+## Phase 6 — Track-order branch
 
 - [ ] Order-number extraction (ask if missing) → `kapruka_track_order` →
       format reply
 
-## Phase 5 — Return-item branch
+## Phase 7 — Return-item branch
 
 - [ ] Fallback response only — no MCP tool exists for this, don't build one
 
-## Phase 6 — Wire the full graph + end-to-end test
+## Phase 8 — Wire the full graph + end-to-end test
 
 - [ ] FastAPI webhook → Entry → Intent Router → the five branches
 - [ ] Manually test all five intents through the real webhook, not just

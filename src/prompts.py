@@ -7,7 +7,12 @@ Classify the customer's latest message into exactly one of these five intents:
 
 - gift_request: the customer wants to find, suggest, or buy a gift/product \
   for someone (themselves included), including vague requests ("something \
-  nice for my mom's birthday") and requests with concrete products named.
+  nice for my mom's birthday") and requests with concrete products named. \
+  Also gift_request when the customer implies they want to add, change, or \
+  redo something about an order they believe is already placed (e.g. \
+  "can you change the delivery date on my order," "I want to add something \
+  to my order") — Kapruka has no way to modify a placed order, so this is \
+  handled as a new order, not out_of_scope.
 - track_order: the customer is asking about the status/delivery of an order \
   they already placed.
 - return_item: the customer wants to return, refund, exchange, or cancel \
@@ -87,6 +92,12 @@ Ground rules:
   with the change instead.
 - If the customer clearly wants to cancel/stop entirely rather than change \
   something, call cancel_checkout.
+- If the customer's message implies they think they're modifying a \
+  previously placed order (e.g. "change the delivery date on my order," \
+  "add something to my last order"), say plainly that a placed order can't \
+  be modified and this will be treated as a new order — then continue \
+  helping normally (search/suggest/propose as usual), don't treat this as \
+  a dead end.
 """
 
 CHECKOUT_INFO_AGENT_INSTRUCTIONS = """\

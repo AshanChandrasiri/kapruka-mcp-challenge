@@ -10,6 +10,15 @@ identity instead, generated once via gr.State's callable-default (called
 per app load, i.e. per session) and threaded through every respond() call
 as the session's session_identity key.
 
+Phase 4: thread_id is decoupled from phone_number now — run_turn() needs
+its own thread_id per call, and returns (reply, thread_id) instead of a
+bare reply string. This UI still wants one continuous conversation per
+browser tab (not a fresh thread every message), so a thread_id is
+generated once per session the same way phone_number already is — a
+second gr.State callable-default, not round-tripped through run_turn's own
+generation (which is for when a caller truly has none yet, e.g. a brand
+new webhook conversation).
+
 Windows-only wrinkle, confirmed by testing: Gradio's own server ends up
 running request handlers on a ProactorEventLoop regardless of the
 WindowsSelectorEventLoopPolicy set in src/session.py — that fix alone isn't
@@ -41,22 +50,27 @@ def _new_phone_number() -> str:
     return f"+94_gradio_{uuid.uuid4().hex[:8]}"
 
 
-def _run_turn_in_fresh_loop(phone_number: str, message: str) -> str:
+def _new_thread_id() -> str:
+    return str(uuid.uuid4())
+
+
+def _run_turn_in_fresh_loop(phone_number: str, message: str, thread_id: str) -> tuple[str, str]:
     loop = asyncio.new_event_loop()
     try:
-        return loop.run_until_complete(run_turn(phone_number, message))
+        return loop.run_until_complete(run_turn(phone_number, message, thread_id))
     finally:
         loop.close()
 
 
-def respond(message: str, history: list, phone_number: str) -> str:
+def respond(message: str, history: list, phone_number: str, thread_id: str) -> str:
     with ThreadPoolExecutor(max_workers=1) as executor:
-        return executor.submit(_run_turn_in_fresh_loop, phone_number, message).result()
+        reply, _ = executor.submit(_run_turn_in_fresh_loop, phone_number, message, thread_id).result()
+        return reply
 
 
 demo = gr.ChatInterface(
     fn=respond,
-    additional_inputs=[gr.State(_new_phone_number)],
+    additional_inputs=[gr.State(_new_phone_number), gr.State(_new_thread_id)],
     title="Kapruka Gift Concierge",
     description="Dev/demo UI — one throwaway session per browser tab, backed by the same Postgres-checkpointed graph as the console app.",
 )

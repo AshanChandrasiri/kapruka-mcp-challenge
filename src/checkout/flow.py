@@ -38,6 +38,28 @@ def is_confirmation(text: str) -> bool:
     return normalized in _CONFIRM_KEYWORDS or normalized.startswith("yes")
 
 
+def _build_compaction_summary(cart: Cart, checkout_info: dict, order_result: dict) -> str:
+    """Phase 4: a short stand-in for the raw transcript, used to replace
+    (not append to) this thread's checkpointed history once compaction
+    runs (src/checkout/compaction.py) — built here, not in compaction.py
+    itself, since cart/checkout_info are about to be cleared by the return
+    dict below and this is the last point that still has them. Folds
+    Cart["notes"] in since it has nowhere else to live once the raw
+    messages containing it are gone; Kapruka's own gift_message field
+    isn't included — checkout_info doesn't carry it at all yet (see
+    Phase 3.8's own flagged gap), nothing to fold in until it's wired up.
+    """
+    product_names = ", ".join(item.get("name", item["product_id"]) for item in cart["items"])
+    summary = (
+        f"[Order placed: {product_names}. Order reference "
+        f"{order_result.get('order_ref')}. Delivered to "
+        f"{checkout_info.get('delivery_city')} on {checkout_info.get('delivery_date')}.]"
+    )
+    if cart.get("notes"):
+        summary += f" Notes: {cart['notes']}"
+    return summary
+
+
 async def complete_order(cart: Cart, checkout_info: dict, phone_number: str) -> dict:
     """The one real financial action in this codebase. Only ever called by
     src/orchestrator.py's deterministic gate, after `_is_confirmation` has
@@ -60,4 +82,11 @@ async def complete_order(cart: Cart, checkout_info: dict, phone_number: str) -> 
         "handoff_reason": None,
         "awaiting_final_yes": None,
         "product_suggestions": [],
+        # Read by src/pipeline.py::run_turn right after this turn's graph
+        # invocation returns — triggers post-order history compaction as
+        # its own separate step, deliberately not sharing this function's
+        # own transaction (a compaction failure must never touch the one
+        # irreversible action in this codebase, which has already
+        # succeeded by this point).
+        "order_summary_for_compaction": _build_compaction_summary(cart, checkout_info, order_result),
     }

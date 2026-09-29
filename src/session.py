@@ -1,8 +1,13 @@
 """Session identity + the shared PostgresSaver checkpointer.
 
-Session identity convention, used by every component: phone_number ==
-user_id == session_id — one shared conversation per phone number, not a
-per-component one.
+Session identity convention: phone_number == user_id == session_id, still
+true and unaffected by Phase 4. `thread_id` is no longer derived from
+phone_number, though — decoupled in Phase 4 so a client (not a
+phone-number-only integration) can own conversation boundaries itself, the
+way a normal chat UI's own "New Chat" button already does. `phone_number`
+stays the permanent customer identity, keying `recipients`/`orders`/
+`order_products`/`threads`; `thread_id` is per-conversation, generated
+fresh by `src/pipeline.py::run_turn` when a caller doesn't supply one.
 """
 
 import asyncio
@@ -20,11 +25,17 @@ if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 
-def session_identity(phone_number: str) -> dict:
-    """RunnableConfig for a turn, keyed by phone_number == user_id == session_id."""
+def session_identity(phone_number: str, thread_id: str) -> dict:
+    """RunnableConfig for a turn. user_id/session_id stay tied to
+    phone_number (customer identity); thread_id is an independent
+    parameter now, resolved by the caller (src/pipeline.py::run_turn) —
+    generated fresh when the client doesn't supply one, so one phone
+    number can now have many independent conversations instead of exactly
+    one, forever.
+    """
     return {
         "configurable": {
-            "thread_id": phone_number,
+            "thread_id": thread_id,
             "user_id": phone_number,
             "session_id": phone_number,
         }

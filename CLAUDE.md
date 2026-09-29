@@ -42,19 +42,36 @@ a real financial action, MCP tool integration) as a portfolio-grade project.
   whatever loop received the HTTP request. `main.py` (console) doesn't need
   this — a bare `asyncio.run()` picks up the policy fine on its own.
 - **State / profile store:** PostgreSQL, hosted on Neon. `src/db/schema.sql`
-  holds the hand-rolled `recipients`/`orders` tables (family profile, order
-  history). LangGraph's `PostgresSaver` checkpointer — `src/session.py`,
-  `get_checkpointer()`, a cached singleton — points at the _same_ Neon
-  instance for turn-by-turn conversation state, so both live in one
-  database, in separate tables (LangGraph owns its checkpoint schema; ours
-  is `recipients`/`orders`). Session identity convention, used by every
-  component: `phone_number == user_id == session_id`
-  (`src/session.py::session_identity`) — one shared conversation, not a
-  per-component one. Windows note: psycopg3's async mode needs
-  `WindowsSelectorEventLoopPolicy` (default `ProactorEventLoop` doesn't
-  support it) — set at import time in `src/session.py`.
+  holds the hand-rolled `recipients`/`orders`/`order_products` (Phase 3.8)/
+  `threads` (Phase 4) tables (family profile, order history, per-item order
+  detail, thread<->customer mapping). LangGraph's `PostgresSaver`
+  checkpointer — `src/session.py`, `get_checkpointer()`, a cached singleton
+  — points at the _same_ Neon instance for turn-by-turn conversation state,
+  so both live in one database, in separate tables (LangGraph owns its
+  checkpoint schema; ours is `recipients`/`orders`/`order_products`/
+  `threads`). Identity convention: `phone_number` is the permanent customer
+  identity (`user_id == session_id == phone_number`, unchanged since
+  Phase 1); `thread_id` is a separate, per-conversation value as of
+  Phase 4 (`src/session.py::session_identity(phone_number, thread_id)`) —
+  see the Chat identity section below for why and how. Windows note:
+  psycopg3's async mode needs `WindowsSelectorEventLoopPolicy` (default
+  `ProactorEventLoop` doesn't support it) — set at import time in
+  `src/session.py`.
 - **LLM:** Google Gemini via LangChain (`langchain-google-genai`) — the configured Gemini API for local
   dev; the model integration can be switched later if needed
+- **Observability:** OpenTelemetry (Phase 5, rolled out incrementally as
+  `5.0.0`/`5.0.1`/... sub-phases) — `src/observability.py`'s reusable
+  `configure()`/`flush()`/`get_tracer()`/`turn_context()`, console-output
+  only so far (`ConsoleSpanExporter`, no Langfuse/OTLP yet).
+  `LANGSMITH_TRACING_MODE=otel` routes LangChain/LangGraph's own run
+  tracing through this same local `TracerProvider` — no LangSmith account,
+  no network call. As of Phase 5.0.1, only `src/pipeline.py::run_turn`'s
+  root span is wired in on purpose, but the LangChain/LangGraph bridge
+  auto-instruments every node of the compiled graph underneath it for
+  free (real Gemini token-usage attributes included) — see the
+  Observability section below for the real limitations found live (a
+  `bytes`-attribute serialization bug, incomplete baggage propagation, and
+  an incomplete failure-status bridge gap) before trusting this further.
 
 ## Kapruka MCP server
 
@@ -243,14 +260,17 @@ response for `chitchat`/`out_of_scope`, the Gift-Picker sub-agent for
 `gift_request`, a stub (log line + placeholder reply) for
 `track_order`/`return_item` until their phases land.
 
-**Entry routing, `_route_from_start` (Phase 3.6 shape):** a conditional
+**Entry routing, `_route_from_start` (Phase 3.7 shape):** a conditional
 edge from `START` itself, checking graph state's `stage`. Absent →
 Intent Router (as above). `with_gift_picker` → straight to the Gift-Picker
 node. `checkout_info` → straight to the Checkout Info Agent node.
-`confirm` → the one deterministic gate check first if `awaiting_final_yes`
-is set (see Human Confirm below), otherwise straight to the Confirm Agent.
-No classifier sits in front of any checkout stage anymore — each stage
-routes directly to the agent that owns it.
+`confirm` → straight to the `confirm_agent` node regardless of
+`awaiting_final_yes` — as of Phase 3.7 that flag is checked INSIDE the
+node's own wrapper function (`_run_confirm_agent`), not at this routing
+layer (see Human Confirm below; Phase 3.6 had a separate
+`check_final_confirmation` node/branch for this, since retired). No
+classifier sits in front of any checkout stage anymore — each stage routes
+directly to the agent that owns it.
 
 **Stages, final shape:** `with_gift_picker` (picking/revising a cart,
 reached once a cart is proposed and awaiting approval, or from any
@@ -373,20 +393,29 @@ pause/resume lives inside LangGraph's own execution/checkpointing, and
 using it here would mean either routing `kapruka_create_order` through an
 LLM agent's tool-calling turn (reintroducing agent/LLM judgment into the
 one place this system deliberately keeps it out) or standing up LangGraph
-resumability just for this one call. Instead: `src/orchestrator.py`'s
-`_route_from_start` checks `stage == "confirm"` AND `awaiting_final_yes`
-(set by the Confirm Agent's `ask_final_confirmation` tool) together — if
-both, `_check_final_confirmation` runs `is_confirmation` directly on the
+resumability just for this one call. Instead (Phase 3.7 shape — folded the
+check into the `confirm_agent` node itself, replacing Phase 3.6's separate
+`check_final_confirmation` node and `_route_from_start` branch):
+`_route_from_start` routes `stage == "confirm"` straight to `confirm_agent`
+regardless of `awaiting_final_yes` (set by the Confirm Agent's
+`ask_final_confirmation` tool); the node's own wrapper function,
+`_run_confirm_agent` (`src/orchestrator.py`), checks `awaiting_final_yes`
+first as plain code — if set, it runs `is_confirmation` directly on the
 customer's raw reply, no agent/LLM call involved in that specific check at
 all. Pass → `complete_order` (the only call site `kapruka_create_order`
 has anywhere in this codebase). Fail → clear `awaiting_final_yes`, fall
-through to the Confirm Agent same turn to actually figure out what the
-customer meant. **Live-verified the gate holds** post-Phase-3.6 exactly
-like it did post-Phase-3: a non-yes reply while `awaiting_final_yes` is
-armed does not check out and correctly falls through to the Confirm Agent
-instead. `kapruka_create_order` itself remains untested against a live
-success response, by design — same deliberate boundary as every prior
-phase, never send a real "yes" during development.
+through in the same function call to the actual compiled Confirm Agent, no
+extra graph hop, to actually figure out what the customer meant.
+**Live-verified the gate holds** post-Phase-3.6, before this Phase 3.7
+relocation: a non-yes reply while `awaiting_final_yes` was armed did not
+check out and correctly fell through to the Confirm Agent instead. The
+safety property itself is unchanged by the Phase 3.7 move (plain code,
+runs before any LLM call, single `complete_order` call site) — only where
+it physically lives moved, from a separate node into the `confirm_agent`
+node's own wrapper — but that specific relocation has not yet been
+re-verified live. `kapruka_create_order` itself remains untested against a
+live success response, by design — same deliberate boundary as every
+prior phase, never send a real "yes" during development.
 
 **Why `Check Delivery` moved into an agent instead of staying a
 deterministic per-item loop:** Phase 3's `_advance_checkout` hard-coded a
@@ -400,15 +429,28 @@ guidance (settle city/date, validate delivery, then ask for the rest)
 replacing the old hard gate order, and its own reasoning against an
 injected today's-date replacing the regex date parse.
 
-On success (`complete_order`, `src/checkout/flow.py`): writes `phone_number`,
-`items` (JSONB), `product_summary`, `total_amount`, `delivery_city`,
-`delivery_date`, `kapruka_order_id`, `status` to `orders`
-(`src/checkout/order.py::save_order` — the `orders` table gained those
-four columns via an `ALTER TABLE` in `src/db/schema.sql`), then
-structurally clears `cart`/`checkout_info`/`stage`/`handoff_reason`/
-`awaiting_final_yes`. `Track Order` here (`src/checkout/order.py::track_order_once`)
+On success (`complete_order`, `src/checkout/flow.py`): as of Phase 3.8,
+`src/checkout/order.py::save_order` is a two-table transactional insert,
+not the old single JSONB-blob row — one `orders` row (`phone_number`,
+`total_amount`/`items_total`/`delivery_fee`/`addons_total`/`currency` from
+`order_result["summary"]`, the six `checkout_info` fields, `payment_url`
+(`order_result["checkout_url"]`) plus a `payment_url_expires_at` computed
+as `now() + 60 minutes` — Kapruka's own guest-checkout pay-link window,
+`kapruka_order_ref` (`order_result["order_ref"]`), `status`), then one
+`order_products` row per cart item (`kapruka_product_id`, `product_name`,
+`product_url`, `product_image_url`, `unit_price`, `quantity`) — replacing
+the old `items` (JSONB) / `product_summary` columns entirely, dropped in
+the same migration. `product_url`/`product_image_url` depend on
+`propose_cart` actually carrying `url`/`image_url` forward per item (its
+docstring was tightened in Phase 3.8 to require both, plus an explicit
+`quantity` field — one row per distinct product, never one row per unit;
+`create_order`'s own cart-quantity was previously hardcoded to `1`
+regardless of what was in the cart, fixed to `item.get("quantity", 1)` in
+the same phase). Then structurally clears
+`cart`/`checkout_info`/`stage`/`handoff_reason`/`awaiting_final_yes`.
+`Track Order` here (`src/checkout/order.py::track_order_once`)
 is a best-effort immediate status check right after checkout — distinct
-from Phase 4's `track_order` _intent_, which is a customer asking about a
+from Phase 5's `track_order` _intent_, which is a customer asking about a
 past order out of the blue. Same MCP tool, two different callers.
 
 Response field names (`order_ref`, `checkout_url`, `summary.grand_total`)
@@ -421,6 +463,148 @@ call has been verified live, but no real "yes" has ever been sent.
 **Hard rule: `kapruka_create_order` is only ever called after an explicit
 human confirm. Never let the agent call checkout directly, and never skip
 the confirmation step "to save a round trip."**
+
+## Chat identity — thread_id decoupled from phone_number (Phase 4)
+
+Through Phase 3.8.1, `session_identity` collapsed `thread_id = user_id =
+session_id = phone_number` — a WhatsApp-shaped assumption (one customer,
+one conversation, forever, no concept of "starting over"). Phase 4 moves
+to a normal chat-agent interface instead, where the client owns
+conversation boundaries the way Claude.ai/ChatGPT's own "New Chat" button
+already does — there's no reason left to guess session boundaries the way
+a phone-number-only integration would have to.
+
+`phone_number` stays the permanent customer identity, keying
+`recipients`/`orders`/`order_products`/`threads` — nothing about that
+changes. `thread_id` is now independent: `src/pipeline.py::run_turn(
+phone_number, message, thread_id=None)` generates a fresh one (`uuid4()`)
+whenever the caller doesn't supply one — that's the actual "no thread_id
+means a new chat" mechanism — and returns `(reply_text, thread_id)` so the
+caller can persist and reuse it on the next call. **Verified live, against
+the real checkpointer, not just by signature:** two turns on the same
+`thread_id` land in the same checkpoint (4 messages after 2 turns);
+supplying no `thread_id` a second time under the same `phone_number`
+produces a genuinely separate checkpoint (a fresh 1-turn history) — the
+decoupling was checked directly against `checkpointer.aget_tuple`, not
+inferred from the reply text (a plain-text reply can look identical
+either way for `chitchat`/`out_of_scope`-shaped messages).
+
+**New `threads` table** (`src/db/schema.sql`, `src/db/threads.py::touch_thread`)
+— `AsyncPostgresSaver` only knows about `thread_id`s, not which customer
+any of them belong to, so without this table there's no way to answer
+"show this customer their past chats" at all (the surface itself isn't
+built yet, just made possible). One upsert per turn
+(`INSERT ... ON CONFLICT (thread_id) DO UPDATE SET last_active_at = now()`)
+handles both "first time this thread_id is seen" (inserts) and "every
+other turn" (updates `last_active_at`) in one statement.
+
+`main.py`'s `THREAD_ID` constant is a hardcoded placeholder, not the real
+mechanism — the console has no way to simulate "a client starting a new
+chat," so it just keeps local dev/testing continuous across restarts.
+`gradio-chat.py` generates its own throwaway `thread_id` once per browser
+session (a second `gr.State` callable-default, same pattern as its
+existing `phone_number` one) rather than round-tripping through
+`run_turn`'s own generation, since it wants one continuous conversation
+per tab. The real behavior (a caller genuinely choosing to pass or omit
+`thread_id` per request) is only meaningfully exercised once the FastAPI
+webhook exists.
+
+**History compaction after a completed order** — no longer the primary
+defense against unbounded history growth (the New Chat boundary is); a
+narrower safety net for a customer who keeps talking in the same thread
+after checkout. `src/checkout/flow.py::complete_order` builds a short
+summary (products, order ref, delivery city/date, `Cart["notes"]` if
+present — Kapruka's own `gift_message` field isn't folded in, since
+`checkout_info` doesn't carry it at all yet, see Phase 3.8's own flagged
+gap) and returns it as `order_summary_for_compaction`, read directly off
+`ainvoke`'s return value by `run_turn` — not re-fetched from state — right
+after that turn's graph invocation returns. `src/checkout/compaction.py::compact_thread`
+then runs as a deliberately separate step (never inside a still-running
+graph invocation, where its own checkpoint writes would race the graph's
+own end-of-step write and lose): `checkpointer.adelete_thread(thread_id)`
+followed by `graph.aupdate_state(config, {...}, as_node="confirm_agent")`
+to seed one fresh checkpoint holding just the summary. Not atomic — a
+crash between the two calls leaves the thread's checkpoint history empty,
+not corrupted; accepted on purpose, since the order itself is already
+safely committed to `orders`/`order_products` by this point, so the worst
+case is lost chat context, not lost order data. Failures are logged, not
+swallowed silently, and can never affect the already-completed order —
+compaction only runs after `complete_order`'s own transaction has already
+succeeded, in a separate step with its own independent try/except.
+**Verified live, against the real orchestrator and real Neon (no real
+order involved — a fabricated summary string was reseeded directly,
+never `kapruka_create_order`):** a 2-turn thread (4 messages) was
+compacted down to exactly 1 message; the very next real turn on that same
+`thread_id` correctly continued from the summary (3 messages: summary +
+new turn), not the pre-compaction history — resolving what was flagged as
+a genuinely open risk during design (delete-then-reseed against the real
+subgraph-based orchestrator, not just a stand-in graph, had never been
+exercised). A forced compaction failure (simulated) was confirmed caught
+and logged without propagating or affecting anything already written.
+
+## Observability — OpenTelemetry, rolled out incrementally (Phase 5)
+
+`src/observability.py` — reusable pieces so every agent shares one setup
+instead of reinventing it: `configure()` (a `TracerProvider` +
+`SimpleSpanProcessor(ConsoleSpanExporter(...))`, console-output only, no
+Langfuse/OTLP yet), `flush()`, `get_tracer()`, and `turn_context(phone_number,
+thread_id)` (a context manager attaching both as OTel baggage for one
+turn). `configure()` also sets `LANGSMITH_TRACING`/`LANGSMITH_TRACING_MODE=otel`
+so LangChain/LangGraph's own run-tracing routes through this same local
+provider — confirmed directly from the installed `langsmith` source (not
+docs): no LangSmith account, no API key, no network call in this mode.
+**Found live, load-bearing:** if `opentelemetry-sdk`/`-api` aren't actually
+installed, `langsmith`'s `Client` silently falls back to real
+network-based tracing instead of failing loudly — installing them first is
+what actually keeps this local-only, not the mode flag by itself.
+
+**Phase 5.0.1 wired this into exactly one call site on purpose** —
+`src/pipeline.py::run_turn`'s own root span (`SpanKind.SERVER`, wrapping
+the graph invocation, with the Intent Router's classification result added
+as a manual `gift.intent` attribute) — piloted on the simplest agent
+(Intent Router: one LLM call, zero tools, no loop) before touching the
+Gift-Picker/Checkout Info/Confirm agents. **What showed up underneath was
+far more than that one call site, though:** the LangChain/LangGraph OTel
+bridge auto-instruments the ENTIRE compiled graph for free — every node
+(`intent_router`, `gift_picker`, its own `tools`/`model` spans down to
+individual tool calls like `kapruka_search_products`, `LangGraph`,
+`concierge_orchestrator`) gets its own span with real
+`gen_ai.usage.input_tokens`/`output_tokens`/`total_tokens`,
+`gen_ai.request.model`, `gen_ai.system` — no extra code needed per agent.
+
+**Three genuine bridge limitations found live, each verified directly
+rather than assumed, and each either fixed or deliberately accepted rather
+than silently left broken:**
+1. **Fixed:** the bridge sets `gen_ai.prompt`/`gen_ai.completion` as raw
+   `bytes`, which crashed `ConsoleSpanExporter`'s default JSON
+   serialization and silently dropped every bridge-generated span from
+   console output (only this module's own manually-created spans, with no
+   bytes attributes, were ever printing). Root-caused with a diagnostic
+   `SpanProcessor.on_end` inspecting real attribute types, not guessed
+   from the traceback. Fixed via `_console_safe_formatter`, which decodes
+   bytes before delegating to the real `to_json()`.
+2. **Accepted, not fixed — a real trade-off, not an oversight:**
+   `turn_context`'s baggage reaches this module's own spans but not the
+   bridge's, because `langsmith.Client`'s default `auto_batch_tracing=True`
+   creates those spans from a background thread that never inherits the
+   calling context. A fix (`auto_batch_tracing=False`) was tried and
+   rejected live: it also bypassed the client's otel-only network guard
+   and fired real authenticated requests at `api.smith.langchain.com`
+   (confirmed via real `401` errors) — preserving "no network call, ever"
+   was judged more important than complete baggage coverage.
+3. **Accepted, flagged as follow-on work:** the bridge never calls
+   `span.set_status(ERROR)`/`record_exception()` on a span that actually
+   failed (verified live with a deliberately invalid model name) — the
+   failure text lands as unstructured JSON inside `gen_ai.completion`, but
+   the span's own OTel status stays `OK`. Only spans this module creates
+   itself get correctly marked. Sharpens (doesn't just restate) the
+   already-planned future work of adding `record_exception`/`set_status`
+   calls — turns out to be needed for the auto-instrumented layer too, not
+   only the hand-written spans planned for the deterministic pipeline
+   (raw MCP client, DB writes, compaction) once those get instrumented.
+
+See `PLAN.md`'s Phase 5.0.0/5.0.1 entries for the full verification detail
+and exact commands run.
 
 ## Known capability gap
 
