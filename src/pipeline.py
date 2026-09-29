@@ -6,7 +6,9 @@ import asyncio
 import uuid
 
 from langchain_core.messages import HumanMessage
+from opentelemetry.trace import SpanKind
 
+from src import observability
 from src.checkout.compaction import compact_thread
 from src.db.threads import touch_thread
 from src.orchestrator import build_orchestrator
@@ -40,9 +42,26 @@ async def run_turn(phone_number: str, message: str, thread_id: str | None = None
 
     orchestrator = await _get_orchestrator()
     config = session_identity(phone_number, resolved_thread_id)
-    result = await orchestrator.ainvoke(
-        {"messages": [HumanMessage(content=message)]}, config=config
-    )
+
+    # Phase 5.0.1: SpanKind.SERVER specifically matters here, not just as a
+    # formality — a console app emits no server-shaped spans otherwise,
+    # since nothing else in the process would create one. turn_context
+    # must wrap the span (not the other way around) so the baggage it
+    # attaches is already the "current" context by the time this span and
+    # everything nested under it (the Intent Router's own LLM call, once
+    # instrumented) gets created.
+    with observability.turn_context(phone_number, resolved_thread_id):
+        tracer = observability.get_tracer()
+        with tracer.start_as_current_span("run_turn", kind=SpanKind.SERVER) as span:
+            result = await orchestrator.ainvoke(
+                {"messages": [HumanMessage(content=message)]}, config=config
+            )
+            # Domain-specific enrichment the auto-instrumentation won't
+            # produce on its own — absent whenever this turn never reached
+            # the Intent Router (already mid-checkout, stage was set).
+            intent = result.get("intent")
+            if intent:
+                span.set_attribute("gift.intent", intent)
 
     compaction_summary = result.get("order_summary_for_compaction")
     if compaction_summary:

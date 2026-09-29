@@ -6,6 +6,7 @@ FastAPI webhook and Gradio dev UI will use later.
 import asyncio
 import sys
 
+from src import observability
 from src.pipeline import run_turn
 
 # Windows console defaults to cp1252, which can't encode the emoji in some
@@ -24,17 +25,21 @@ THREAD_ID = "+94_console_dev_thread"
 
 
 async def main() -> None:
+    observability.configure()
     print("Kapruka Gift Concierge (console) — Ctrl+C to quit\n")
-    while True:
-        try:
-            message = input("you> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            break
-        if not message:
-            continue
-        reply, _ = await run_turn(PHONE_NUMBER, message, THREAD_ID)
-        print(f"bot> {reply}\n")
+    try:
+        while True:
+            try:
+                message = input("you> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+            if not message:
+                continue
+            reply, _ = await run_turn(PHONE_NUMBER, message, THREAD_ID)
+            print(f"bot> {reply}\n")
+    finally:
+        observability.flush()
 
 
 if __name__ == "__main__":

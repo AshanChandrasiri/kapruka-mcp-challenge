@@ -59,6 +59,19 @@ a real financial action, MCP tool integration) as a portfolio-grade project.
   `src/session.py`.
 - **LLM:** Google Gemini via LangChain (`langchain-google-genai`) — the configured Gemini API for local
   dev; the model integration can be switched later if needed
+- **Observability:** OpenTelemetry (Phase 5, rolled out incrementally as
+  `5.0.0`/`5.0.1`/... sub-phases) — `src/observability.py`'s reusable
+  `configure()`/`flush()`/`get_tracer()`/`turn_context()`, console-output
+  only so far (`ConsoleSpanExporter`, no Langfuse/OTLP yet).
+  `LANGSMITH_TRACING_MODE=otel` routes LangChain/LangGraph's own run
+  tracing through this same local `TracerProvider` — no LangSmith account,
+  no network call. As of Phase 5.0.1, only `src/pipeline.py::run_turn`'s
+  root span is wired in on purpose, but the LangChain/LangGraph bridge
+  auto-instruments every node of the compiled graph underneath it for
+  free (real Gemini token-usage attributes included) — see the
+  Observability section below for the real limitations found live (a
+  `bytes`-attribute serialization bug, incomplete baggage propagation, and
+  an incomplete failure-status bridge gap) before trusting this further.
 
 ## Kapruka MCP server
 
@@ -528,6 +541,70 @@ a genuinely open risk during design (delete-then-reseed against the real
 subgraph-based orchestrator, not just a stand-in graph, had never been
 exercised). A forced compaction failure (simulated) was confirmed caught
 and logged without propagating or affecting anything already written.
+
+## Observability — OpenTelemetry, rolled out incrementally (Phase 5)
+
+`src/observability.py` — reusable pieces so every agent shares one setup
+instead of reinventing it: `configure()` (a `TracerProvider` +
+`SimpleSpanProcessor(ConsoleSpanExporter(...))`, console-output only, no
+Langfuse/OTLP yet), `flush()`, `get_tracer()`, and `turn_context(phone_number,
+thread_id)` (a context manager attaching both as OTel baggage for one
+turn). `configure()` also sets `LANGSMITH_TRACING`/`LANGSMITH_TRACING_MODE=otel`
+so LangChain/LangGraph's own run-tracing routes through this same local
+provider — confirmed directly from the installed `langsmith` source (not
+docs): no LangSmith account, no API key, no network call in this mode.
+**Found live, load-bearing:** if `opentelemetry-sdk`/`-api` aren't actually
+installed, `langsmith`'s `Client` silently falls back to real
+network-based tracing instead of failing loudly — installing them first is
+what actually keeps this local-only, not the mode flag by itself.
+
+**Phase 5.0.1 wired this into exactly one call site on purpose** —
+`src/pipeline.py::run_turn`'s own root span (`SpanKind.SERVER`, wrapping
+the graph invocation, with the Intent Router's classification result added
+as a manual `gift.intent` attribute) — piloted on the simplest agent
+(Intent Router: one LLM call, zero tools, no loop) before touching the
+Gift-Picker/Checkout Info/Confirm agents. **What showed up underneath was
+far more than that one call site, though:** the LangChain/LangGraph OTel
+bridge auto-instruments the ENTIRE compiled graph for free — every node
+(`intent_router`, `gift_picker`, its own `tools`/`model` spans down to
+individual tool calls like `kapruka_search_products`, `LangGraph`,
+`concierge_orchestrator`) gets its own span with real
+`gen_ai.usage.input_tokens`/`output_tokens`/`total_tokens`,
+`gen_ai.request.model`, `gen_ai.system` — no extra code needed per agent.
+
+**Three genuine bridge limitations found live, each verified directly
+rather than assumed, and each either fixed or deliberately accepted rather
+than silently left broken:**
+1. **Fixed:** the bridge sets `gen_ai.prompt`/`gen_ai.completion` as raw
+   `bytes`, which crashed `ConsoleSpanExporter`'s default JSON
+   serialization and silently dropped every bridge-generated span from
+   console output (only this module's own manually-created spans, with no
+   bytes attributes, were ever printing). Root-caused with a diagnostic
+   `SpanProcessor.on_end` inspecting real attribute types, not guessed
+   from the traceback. Fixed via `_console_safe_formatter`, which decodes
+   bytes before delegating to the real `to_json()`.
+2. **Accepted, not fixed — a real trade-off, not an oversight:**
+   `turn_context`'s baggage reaches this module's own spans but not the
+   bridge's, because `langsmith.Client`'s default `auto_batch_tracing=True`
+   creates those spans from a background thread that never inherits the
+   calling context. A fix (`auto_batch_tracing=False`) was tried and
+   rejected live: it also bypassed the client's otel-only network guard
+   and fired real authenticated requests at `api.smith.langchain.com`
+   (confirmed via real `401` errors) — preserving "no network call, ever"
+   was judged more important than complete baggage coverage.
+3. **Accepted, flagged as follow-on work:** the bridge never calls
+   `span.set_status(ERROR)`/`record_exception()` on a span that actually
+   failed (verified live with a deliberately invalid model name) — the
+   failure text lands as unstructured JSON inside `gen_ai.completion`, but
+   the span's own OTel status stays `OK`. Only spans this module creates
+   itself get correctly marked. Sharpens (doesn't just restate) the
+   already-planned future work of adding `record_exception`/`set_status`
+   calls — turns out to be needed for the auto-instrumented layer too, not
+   only the hand-written spans planned for the deterministic pipeline
+   (raw MCP client, DB writes, compaction) once those get instrumented.
+
+See `PLAN.md`'s Phase 5.0.0/5.0.1 entries for the full verification detail
+and exact commands run.
 
 ## Known capability gap
 

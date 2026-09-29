@@ -1449,16 +1449,268 @@ completed order)
       no code path by which a compaction failure could reach back and
       touch `orders`/`order_products` regardless.
 
-## Phase 5 — Track-order branch
+
+## Phase 5 — Observability (OpenTelemetry: request tracing, per-agent token usage, tool-call visibility)
+
+**Problem being fixed:** none of this codebase currently has any way to
+see a request trace, identify where a turn went wrong, or measure token
+usage per agent or tool call — every diagnosis so far has depended on
+reading console prints or re-running a scenario by hand.
+
+**Decision:** OpenTelemetry, built around reusable shared components so
+every agent (Intent Router, Gift-Picker, Checkout Info Agent, Confirm
+Agent, and the deterministic pipeline) reuses the same setup rather than
+each reinventing it. Rolled out incrementally, not all at once — broken
+into its own numbered sub-phases below (`5.0.0`, `5.0.1`, and more as the
+rollout continues), each independently buildable and verifiable on its
+own rather than one large phase that can only be checked off as a whole.
+
+### Phase 5.0.0 — Observability scaffolding: reusable OpenTelemetry setup, no agent wired in yet (built and verified live 2026-09-29)
+
+**Decision:** build one shared module now, console-output only — no
+Langfuse, no OTLP export, nothing sent anywhere external. Nothing in this
+sub-phase touches an actual agent's code; that's deliberately Phase
+5.0.1's job, kept separate so a problem in the scaffolding and a problem
+in the first real integration aren't debugged at the same time.
+
+- [x] New module, `src/observability.py`:
+      - `configure()` — a `TracerProvider` with a `SimpleSpanProcessor` +
+        `ConsoleSpanExporter` (not `BatchSpanProcessor` — for a
+        console-output-only phase, exporting each span the instant it
+        completes is simpler and more predictable than a batch timer, and
+        avoids depending on an explicit flush for correctness; batching
+        becomes worth it again once a real network destination like
+        Langfuse enters the picture later). Also sets
+        `LANGSMITH_TRACING_MODE=otel` — confirmed directly from the
+        installed `langsmith` package's source (not docs) to route
+        LangChain/LangGraph's own run-tracing through this same
+        `TracerProvider`, entirely locally, no LangSmith account or API
+        key involved.
+      - `flush()` — force-flushes the provider before process exit. Less
+        critical with `SimpleSpanProcessor` than it would be with
+        `BatchSpanProcessor`, but kept as cheap insurance and because it
+        becomes load-bearing again the moment this moves to a batched,
+        networked exporter.
+      - `turn_context(phone_number, thread_id)` — a context manager
+        attaching both as OpenTelemetry baggage, so every span created
+        for the duration of one turn — across whichever agent or tool
+        runs — carries them automatically, with nothing threaded through
+        function signatures. Not exercised by any real span in this
+        sub-phase (no agent is wired in yet); built now so Phase 5.0.1
+        doesn't need to.
+      - `get_tracer()` — one named tracer, used everywhere from here on,
+        instead of each module creating its own.
+- [x] `requirements.txt` additions: `opentelemetry-sdk`,
+      `opentelemetry-api`, `langsmith[otel]` (the LangChain/LangGraph
+      bridge — a local instrumentation shim in this configuration, not a
+      dependency on the LangSmith product). `langsmith` itself stayed at
+      the already-installed `0.12.4` — its OTEL bridge is present there
+      already (confirmed by reading the installed source), no version
+      bump needed; the `[otel]` extra just pulled in the
+      `opentelemetry-exporter-otlp-*` packages (unused until a later
+      sub-phase swaps in a real OTLP destination).
+- [x] `scripts/check_otel.py` — a standalone smoke test, same pattern as
+      Phase 0's `check_llm.py`/`check_mcp.py`/`check_db.py`: calls
+      `configure()`, opens one manual span with a fake attribute, confirms
+      it prints to console. Validates the scaffolding in isolation —
+      whether OpenTelemetry itself is configured correctly — as a
+      separate question from whether the LangChain/LangGraph bridge
+      correctly captures a real agent, which is what Phase 5.0.1 actually
+      tests.
+- [x] Explicitly not done here: no agent's code changes, `main.py` is
+      untouched, no root span exists yet for a real turn. That's Phase
+      5.0.1, not this one.
+
+#### Verification checklist
+- [x] `python scripts/check_otel.py` prints a span to the console with the
+      expected name and attribute — confirms the provider/exporter/bridge
+      configuration works before anything real depends on it. **Verified
+      live**: printed a `check_otel.manual_span` span with
+      `check.fake_attribute="hello-otel"` and, as a bonus early check of
+      `turn_context`/`_BaggageSpanProcessor` (not required by this
+      sub-phase's own scope, but cheap to confirm now rather than wait for
+      5.0.1), correct `phone_number`/`thread_id` baggage attributes on the
+      same span.
+- [x] `LANGSMITH_TRACING_MODE=otel` genuinely makes no network call to any
+      LangSmith endpoint — verify directly (e.g. no outbound request in a
+      network capture, or confirm from the installed package's own logic)
+      rather than trusting the env var's name alone. **Verified two ways**:
+      (1) read `langsmith/client.py`'s source directly — `Client.info`
+      explicitly skips its API call when `tracing_mode == "otel"`, and
+      `Client.__init__`'s otel-setup branch never touches the network
+      either. (2) Live-constructed a real `Client(tracing_mode="otel")`
+      with no `LANGSMITH_API_KEY` set anywhere in this project's `.env` —
+      succeeded with no error, and `.info` returned a local stub
+      (`LangSmithInfo(version='', ...)`), not a fetched response, matching
+      the source-level finding rather than just trusting it. **Also found
+      live, not anticipated in the plan:** if `opentelemetry` isn't
+      actually installed, `langsmith`'s `Client` silently falls BACK to
+      real network-based `"langsmith"` mode instead of failing loudly
+      (confirmed in the installed source's `except ImportError` branch) —
+      a real footgun this project avoided only by installing
+      `opentelemetry-sdk`/`-api` before ever setting `LANGSMITH_TRACING`,
+      not by the mode flag alone.
+
+### Phase 5.0.1 — Wire it into one agent: the Intent Router, verified via `main.py` (built and verified live 2026-09-29 — two genuine bridge limitations found and accepted, see below)
+
+**Problem being fixed:** Phase 5.0.0's scaffolding is unverified against a
+real agent until something actually uses it. Rolling out to all four
+agents at once would make a failure hard to localize — is it the
+scaffolding, the bridge, or something specific to whichever agent broke
+first? Piloting on one agent first isolates that.
+
+**Decision:** the Intent Router, not the Gift-Picker — it's the simplest
+possible case (a single LLM call, zero tools, no ReAct loop, no
+cross-agent handoff), which minimizes what could confound a first result.
+Verification is entirely by reading `main.py`'s console output, matching
+Phase 5.0.0's own "logging only, no dashboard yet" scope — nothing here
+talks to Langfuse.
+
+- [x] `run_turn()` (`src/pipeline.py`) — wrap the existing `ainvoke` call
+      in `get_tracer().start_as_current_span("run_turn", kind=SpanKind.SERVER)`,
+      itself inside `turn_context(phone_number, thread_id)`. `SpanKind.SERVER`
+      specifically matters here, not just as a formality — a console app
+      emits no server-shaped spans otherwise, since nothing else in the
+      process would create one.
+- [x] `main.py` — one call to `observability.configure()` at startup, one
+      call to `observability.flush()` before the process exits.
+- [x] After the Intent Router returns, add the classification result as a
+      manual attribute on the current span (e.g. `trace.get_current_span()
+      .set_attribute("gift.intent", result)`) — this is domain-specific
+      enrichment the auto-instrumentation won't produce on its own, the
+      same pattern used for adding facts onto an already-open span rather
+      than creating a redundant new one.
+- [x] No handoff span in this sub-phase — with only the Intent Router
+      instrumented, there's nothing yet to hand off *to* (canned
+      `chitchat`/`out_of_scope` replies, and `gift_request` is still just
+      a stub downstream). That pattern becomes relevant starting with
+      Phase 5.0.2 or whichever sub-phase extends this to the Gift-Picker.
+- [x] **Genuinely unverified going in, not assumed:** whether
+      `langsmith[otel]`'s bridge correctly captures `create_agent`-as-
+      subgraph-node's LLM call with real Gemini token-usage attributes.
+      The bridge's existence and its local-only `OTEL` mode were
+      confirmed by reading its installed source; whether it correctly
+      understands *this* project's specific LangGraph shape has not been
+      run live. This is the first thing to actually check once this
+      sub-phase runs, not something to take on faith from having read the
+      code. **Answer: yes, and considerably more than hoped** — the bridge
+      doesn't just capture the Intent Router's own LLM call, it
+      auto-instruments the ENTIRE compiled graph for free: every LangGraph
+      node got its own span (`__start__`, `_route_from_start`,
+      `intent_router`, `extract_intent`, `_route_on_intent`,
+      `chitchat_node`/`gift_picker`, the Gift-Picker's own `tools`/`model`/
+      `ChatGoogleGenerativeAI` spans down to individual tool calls like
+      `kapruka_search_products`, `LangGraph`, `concierge_orchestrator`),
+      each carrying real `gen_ai.usage.input_tokens`/`output_tokens`/
+      `total_tokens`, `gen_ai.request.model`, `gen_ai.system`. **But this
+      needed a real bug fix first, not just observation** — see the
+      `bytes`-attribute finding below.
+
+#### Explicitly deferred — the roadmap past this pilot, not built here
+- [ ] Extending the same reusable pieces to the Gift-Picker, Checkout
+      Info Agent, and Confirm Agent — no new reusable code needed, since
+      `turn_context`/`get_tracer` already cover them.
+- [ ] Explicit "handoff" spans at the real orchestrator transition points
+      (`with_gift_picker`→`checkout_info`, `checkout_info`→`confirm`, any
+      `handoff_reason` hand-back) — the auto-instrumentation captures each
+      agent's own internal work but nothing that marks one agent handing
+      control to another; that needs a deliberately added span at each
+      transition, not something that appears for free.
+- [ ] Tool-call enrichment inside each `@tool` function via
+      `trace.get_current_span().set_attribute(...)` — adding attributes
+      to the span the framework already creates for a tool call, not a
+      new span wrapping it.
+- [ ] Manual spans for the non-LangChain deterministic pipeline (the raw
+      MCP client in `src/checkout/mcp_client.py`, DB writes in
+      `save_order`/`get_recipient_profile`, the compaction step) — none
+      of these go through LangChain's callback system, so none of them
+      get instrumented for free the way the agent-layer calls do.
+      Genuine hand-written-span work, not a configuration change.
+- [ ] Proper `span.record_exception()` + `span.set_status(...)` at
+      failure points — the standard OpenTelemetry idiom for marking a
+      span as failed, so "where did it go wrong" is visible to any
+      OTel-compatible viewer without a custom convention to remember.
+      **Sharpened by a live finding in this sub-phase, not just still
+      deferred as originally scoped:** this turns out to be needed for the
+      auto-instrumented bridge spans too, not only the hand-written
+      deterministic-pipeline ones — see the verification checklist below.
+- [ ] Swapping `ConsoleSpanExporter` for an OTLP exporter pointed at a
+      self-hosted Langfuse instance — one exporter line, once there's
+      something worth looking at beyond console output.
+
+#### Verification checklist
+- [x] `main.py` run through a `chitchat` message and a real classification
+      message, console output inspected directly for: a `run_turn` span
+      of `SpanKind.SERVER`, a nested span for the Intent Router's own LLM
+      call, `gen_ai.usage.input_tokens`/`gen_ai.usage.output_tokens` (or
+      whatever the actual attribute names turn out to be — the OTel GenAI
+      semantic conventions are still in Development status as of this
+      writing, so treat exact names as subject to drift, not frozen) on
+      that nested span, and the manually added `gift.intent` attribute.
+      **Verified live** — all present, exactly as named above (not
+      "whatever the names turn out to be": `gen_ai.usage.input_tokens`/
+      `output_tokens`/`total_tokens` matched the anticipated names exactly).
+      **Found and fixed live to get here, not anticipated in the plan:**
+      the langsmith bridge sets `gen_ai.prompt`/`gen_ai.completion` as raw
+      `bytes`, which crashed `ConsoleSpanExporter`'s default JSON
+      serialization and silently dropped every bridge-generated span from
+      console output — only this module's own manually-created `run_turn`
+      span (no bytes attributes) was ever printing. Root-caused via a
+      diagnostic `SpanProcessor.on_end` that inspected each attribute's
+      Python type on a real span, not guessed from the traceback alone.
+      Fixed in `src/observability.py::_console_safe_formatter` (decodes
+      bytes to `str` before delegating to the real `to_json()`) — see that
+      module's own docstring for the full detail.
+- [x] `phone_number`/`thread_id` baggage attributes are present on both
+      the root span and the nested LLM-call span — confirms baggage
+      propagation actually reaches child spans, not just the one it was
+      attached from. **Partially true, verified live, not fully — a real
+      limitation, not a bug left unfixed:** present on the root `run_turn`
+      span (confirmed). NOT present on the langsmith-bridge-generated
+      nested spans — root-caused by directly inspecting
+      `threading.current_thread()` inside the bridge's own span-creation
+      call: `langsmith.Client`'s default `auto_batch_tracing=True` creates
+      those spans from a background `tracing_control_thread_func` thread,
+      which never inherits the calling thread/task's attached
+      `contextvars` baggage context. **A fix was attempted and explicitly
+      rejected, not left untried:** `Client(auto_batch_tracing=False,
+      tracing_mode="otel")` does make spans create on the calling thread
+      (baggage would reach them) — but live-testing it showed it ALSO
+      bypasses the client's own otel-only network guard and fires real
+      authenticated requests at `api.smith.langchain.com` (confirmed via
+      real `401 Unauthorized` errors — a genuine outbound network call,
+      exactly what this whole setup exists to avoid). Judged "no network
+      call, ever" more important than complete baggage coverage, so the
+      default `auto_batch_tracing=True` is kept and this gap is accepted
+      as a documented limitation (see `src/observability.py`'s docstring),
+      not silently worked around.
+- [x] A deliberately broken call (e.g. a bad model name) produces a span
+      that's visibly marked as failed in the console output, not just a
+      Python traceback with no corresponding span-level signal.
+      **Verified live with a real invalid model name — true for this
+      module's own span, not for the bridge's:** the root `run_turn` span
+      correctly got `status_code: ERROR` plus a recorded `exception` event
+      (OTel's own default behavior when an exception exits a
+      `start_as_current_span` block). The actual failing
+      `ChatGoogleGenerativeAI`/`model` spans from the bridge stayed
+      `status_code: OK` — the failure text does land inside their
+      `gen_ai.completion` attribute as unstructured JSON, but the bridge
+      never calls `set_status`/`record_exception` on them. This is a
+      concrete instance of the "Explicitly deferred" `record_exception`/
+      `set_status` item above turning out to matter for the
+      auto-instrumented layer too — not just the deterministic pipeline it
+      was originally scoped for.
+
+## Phase 6 — Track-order branch
 
 - [ ] Order-number extraction (ask if missing) → `kapruka_track_order` →
       format reply
 
-## Phase 6 — Return-item branch
+## Phase 7 — Return-item branch
 
 - [ ] Fallback response only — no MCP tool exists for this, don't build one
 
-## Phase 7 — Wire the full graph + end-to-end test
+## Phase 8 — Wire the full graph + end-to-end test
 
 - [ ] FastAPI webhook → Entry → Intent Router → the five branches
 - [ ] Manually test all five intents through the real webhook, not just

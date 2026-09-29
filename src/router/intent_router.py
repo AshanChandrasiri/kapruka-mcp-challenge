@@ -59,7 +59,14 @@ async def classify_intent(phone_number: str, message: str) -> IntentClassificati
     to that session — it's a side read, not a turn.
     """
     checkpointer = await get_checkpointer()
-    config = session_identity(phone_number)
+    # Phase 4 decoupled thread_id from phone_number, but this standalone
+    # path (isolated testing / non-orchestrator use, a side read not a
+    # turn) never had a real thread_id to plumb through — it already
+    # relies on each call site using a distinct phone_number for isolation
+    # (see scripts/test_intent_router.py's per-case phone numbers), so
+    # phone_number doubles as thread_id here, same 1:1 relationship this
+    # function always assumed pre-Phase-4.
+    config = session_identity(phone_number, thread_id=phone_number)
     checkpoint_tuple = await checkpointer.aget_tuple(config)
 
     history: list[AnyMessage] = []
