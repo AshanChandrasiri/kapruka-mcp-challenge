@@ -77,6 +77,7 @@ over:**
    ones over the deterministic pipeline.
 """
 
+import base64
 from contextlib import contextmanager
 from typing import Iterator
 
@@ -84,7 +85,10 @@ from opentelemetry import baggage as otel_baggage
 from opentelemetry import context as otel_context
 from opentelemetry import trace
 from opentelemetry.sdk.trace import ReadableSpan, Span, SpanProcessor, TracerProvider
-from opentelemetry.sdk.trace.export import ConsoleSpanExporter, SimpleSpanProcessor
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter, SimpleSpanProcessor
+from opentelemetry.trace import Status, StatusCode
+
+from src.config import APP_ENV, LANGFUSE_BASE_URL, LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY
 
 _TRACER_NAME = "kapruka-gift-concierge"
 
@@ -105,6 +109,60 @@ class _BaggageSpanProcessor(SpanProcessor):
 
     def on_end(self, span: ReadableSpan) -> None:
         pass
+
+    def shutdown(self) -> None:
+        pass
+
+    def force_flush(self, timeout_millis: int = 30000) -> bool:
+        return True
+
+
+class _ErrorDetectionSpanProcessor(SpanProcessor):
+    """Phase 5.0.4: corrects the langsmith bridge's own gap — confirmed
+    live, not guessed, and NOT the shape this phase's own plan originally
+    assumed: a failed model call's `gen_ai.completion` turns out to be
+    just an empty `{"generations": [[]], ...}`, no embedded error text.
+    The real, more precise signal already sitting on the span is a
+    standard OTel `exception` event (the bridge DOES call
+    `record_exception()`-equivalent on the span that actually failed, and
+    on every ancestor span up to the compiled graph's own span) — it just
+    never follows that up with `set_status(ERROR)`, leaving `status` at
+    `OK` on all of them. Verified live with a deliberately invalid model
+    name: `ChatGoogleGenerativeAI`, `model`, `LangGraph`, `intent_router`,
+    and `concierge_orchestrator` all carried the exception event with
+    `status: OK`; only this project's own hand-written `run_turn` span
+    (via `start_as_current_span`'s default exception behavior) had it
+    right already.
+
+    **Bypasses the public `set_status()` on purpose, not by accident:**
+    OTel's own `Span.set_status()` explicitly no-ops once a span's status
+    is already `OK` ("Ignore future calls if status is already set to
+    OK") — confirmed by reading the installed SDK source, not assumed — a
+    deliberate spec guard against flip-flopping a final status, which
+    means the public API genuinely cannot be used to fix this after the
+    bridge has already set `OK`. Mutating `span._status` directly is the
+    only way to override it — same category of private-attribute
+    workaround this module already uses once for `_console_safe_formatter`'s
+    bytes decoding.
+
+    Must be added to the provider BEFORE the console-exporting processor
+    — `SynchronousMultiSpanProcessor` (the SDK's own multi-processor
+    fan-out) calls every processor's `on_end()` in add-order for the same
+    span, so this correction needs to land before
+    `SimpleSpanProcessor(ConsoleSpanExporter(...))`'s own `on_end()` call
+    exports it.
+    """
+
+    def on_start(self, span: Span, parent_context=None) -> None:
+        pass
+
+    def on_end(self, span: ReadableSpan) -> None:
+        if span.status.status_code != StatusCode.OK:
+            return
+        if any(event.name == "exception" for event in span.events):
+            span._status = Status(  # noqa: SLF001
+                StatusCode.ERROR, "corrected: bridge recorded an exception but left status OK"
+            )
 
     def shutdown(self) -> None:
         pass
@@ -144,11 +202,56 @@ def _console_safe_formatter(span: ReadableSpan) -> str:
         span._attributes = original  # noqa: SLF001
 
 
+def _build_export_processor() -> SpanProcessor:
+    """`APP_ENV` (`development` by default) chooses the destination —
+    everything else about how a span is built (baggage, error correction)
+    stays identical in both environments; only where it ends up changes.
+
+    `development`: unchanged from every prior Phase 5.0.x sub-phase —
+    `SimpleSpanProcessor` exports each span synchronously, the instant it
+    completes, straight to the console. Fine with no real network
+    destination; `_console_safe_formatter`'s bytes-decoding workaround
+    stays console-only and needs no production equivalent, since the OTLP
+    exporter serializes spans itself and never goes through
+    `ConsoleSpanExporter.to_json()` at all.
+
+    `production`: the same spans, routed to Langfuse Cloud over OTLP
+    instead — confirmed directly from Langfuse's own OpenTelemetry docs,
+    not assumed: **HTTP/protobuf only, gRPC is not supported**, so this
+    imports `opentelemetry.exporter.otlp.proto.http`'s `OTLPSpanExporter`
+    specifically, not the generic gRPC-defaulting `opentelemetry-exporter-otlp`
+    package. `BatchSpanProcessor`, not `SimpleSpanProcessor` — exporting
+    synchronously on the calling thread would add real network latency to
+    every turn now that there's an actual network destination; this is
+    the exact "load-bearing again" moment Phase 5.0.0's own `flush()`
+    docstring already anticipated. Auth is plain HTTP Basic
+    (`base64(public_key:secret_key)`), built once here — no separate
+    Langfuse SDK needed, since this app already speaks raw OTel end to
+    end. Missing/invalid keys are deliberately NOT validated here: OTel's
+    own exporters already log-and-continue on a failed export rather than
+    raising, which is exactly the "never let a broken observability
+    backend take the concierge down" behavior this phase wants — adding
+    our own validation on top would just be a second way to get the same
+    outcome, or worse, a way to accidentally turn a silent degradation
+    into a hard failure.
+    """
+    if APP_ENV != "production":
+        return SimpleSpanProcessor(ConsoleSpanExporter(formatter=_console_safe_formatter))
+
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+
+    auth = base64.b64encode(f"{LANGFUSE_PUBLIC_KEY}:{LANGFUSE_SECRET_KEY}".encode()).decode()
+    endpoint = f"{LANGFUSE_BASE_URL.rstrip('/')}/api/public/otel/v1/traces"
+    exporter = OTLPSpanExporter(endpoint=endpoint, headers={"Authorization": f"Basic {auth}"})
+    return BatchSpanProcessor(exporter)
+
+
 def configure() -> None:
-    """Set up the global TracerProvider (console-output only) and route
-    LangChain/LangGraph's own tracing through it via langsmith's OTEL
-    bridge. Call once, at process startup, before any agent runs — idempotent,
-    safe to call more than once (e.g. accidentally, from a test script).
+    """Set up the global TracerProvider and route LangChain/LangGraph's own
+    tracing through it via langsmith's OTEL bridge. Call once, at process
+    startup, before any agent runs — idempotent, safe to call more than
+    once (e.g. accidentally, from a test script). Export destination is
+    `APP_ENV`-conditional — see _build_export_processor.
     """
     global _provider
     if _provider is not None:
@@ -161,9 +264,10 @@ def configure() -> None:
 
     provider = TracerProvider()
     provider.add_span_processor(_BaggageSpanProcessor())
-    provider.add_span_processor(
-        SimpleSpanProcessor(ConsoleSpanExporter(formatter=_console_safe_formatter))
-    )
+    # Must run before the exporting processor below — see
+    # _ErrorDetectionSpanProcessor's own docstring for why add-order matters.
+    provider.add_span_processor(_ErrorDetectionSpanProcessor())
+    provider.add_span_processor(_build_export_processor())
     trace.set_tracer_provider(provider)
     _provider = provider
 

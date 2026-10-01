@@ -107,6 +107,20 @@ off, giving the next agent's model call a proper user turn to end on.
 makes no agent/LLM call itself, so `messages` still ends on the customer's
 own real reply when `confirm_agent` picks it up.
 
+**Phase 5.0.2: these same three transition nodes each open a manual
+`"handoff"` OTel span** (`handoff.from_agent`/`to_agent`/`reason`) right
+before returning — the LangGraph trace tree otherwise only shows node
+names, with no span stating "agent A finished, agent B took over, and
+here's why." `_handoff_to_gift_picker`'s `from_agent` is inferred from
+`state["stage"]` at the moment it runs (still whatever it was on entry
+into this turn's checkout-agent run, since `request_cart_revision` never
+touches `stage` itself) rather than needing a second explicit field —
+`checkout_info` -> `checkout_info_agent`, `confirm` -> `confirm_agent`.
+`enter_checkout_info`/`enter_confirm`'s reasons are fixed strings
+(`"cart_confirmed"`/`"checkout_info_finalized"`) since those two
+transitions are deterministic triggers, not free text the way
+`handoff_reason` is for a hand-back.
+
 **`cancel_checkout` is a shared tool now, not a router-reached node** — any
 of the three agents can recognize "the customer wants out" and call it
 directly; it clears `stage` to `None`, which every `_route_after_*`
@@ -146,6 +160,8 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.channels.ephemeral_value import EphemeralValue
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
+
+from src import observability
 
 from src.checkout.checkout_info_agent import build_checkout_info_agent
 from src.checkout.confirm_agent import build_confirm_agent
@@ -277,6 +293,20 @@ def _handoff_to_gift_picker(state: ConciergeState) -> dict:
     turn, so it wasn't visible until the Checkout Info Agent was live-tested.
     """
     reason = state.get("handoff_reason") or "the customer needs something changed."
+    # Phase 5.0.2: this node is the single shared destination for a
+    # hand-back from EITHER checkout agent (_route_after_checkout_info and
+    # _route_after_confirm both route here on handoff_reason) — neither
+    # agent's own tool call (request_cart_revision) touches `stage`, so
+    # it's still whatever it was on entry into this turn's agent run,
+    # making it a reliable way to tell which agent this handoff came from.
+    from_agent = {"checkout_info": "checkout_info_agent", "confirm": "confirm_agent"}.get(
+        state.get("stage"), state.get("stage") or "unknown"
+    )
+    with observability.get_tracer().start_as_current_span("handoff") as span:
+        span.set_attribute("handoff.from_agent", from_agent)
+        span.set_attribute("handoff.to_agent", "gift_picker")
+        span.set_attribute("handoff.reason", reason)
+
     note = HumanMessage(content=f"[System note — not from the customer: {reason}]")
     return {
         "messages": [note],
@@ -321,6 +351,13 @@ def _enter_checkout_info(state: ConciergeState) -> dict:
     closed this turn's shared `messages` on an assistant turn, and the
     Checkout Info Agent's own model call needs it to end on a user turn.
     """
+    with observability.get_tracer().start_as_current_span("handoff") as span:
+        span.set_attribute("handoff.from_agent", "gift_picker")
+        span.set_attribute("handoff.to_agent", "checkout_info_agent")
+        # Deterministic trigger, not a free-text reason — this transition
+        # only ever fires because confirm_cart_and_proceed fired this turn.
+        span.set_attribute("handoff.reason", "cart_confirmed")
+
     note = HumanMessage(
         content="[System note — not from the customer: the customer just approved this "
         "cart. Gather delivery city/date, recipient name/phone, delivery address, and "
@@ -355,6 +392,13 @@ def _enter_confirm(state: ConciergeState) -> dict:
     """Same-turn transition from the Checkout Info Agent (info just
     finalized) — same synthetic-note reasoning as _enter_checkout_info.
     """
+    with observability.get_tracer().start_as_current_span("handoff") as span:
+        span.set_attribute("handoff.from_agent", "checkout_info_agent")
+        span.set_attribute("handoff.to_agent", "confirm_agent")
+        # Deterministic trigger — this transition only ever fires because
+        # finalize_checkout_info fired this turn.
+        span.set_attribute("handoff.reason", "checkout_info_finalized")
+
     note = HumanMessage(
         content="[System note — not from the customer: checkout info is gathered. Show "
         "the order summary and work toward a final yes/no on placing the order.]"

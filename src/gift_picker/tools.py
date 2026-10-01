@@ -10,6 +10,7 @@ from langchain_core.tools import InjectedToolCallId, tool
 
 from langgraph.types import Command
 
+from src import observability
 from src.db.recipients import find_recipients
 from src.gift_picker.state import Cart, ProductSuggestion
 
@@ -114,6 +115,17 @@ def propose_cart(
     with nothing further to change, call confirm_cart_and_proceed instead
     of re-proposing the same cart.
     """
+    # Phase 5.0.5: its own small span, not trace.get_current_span() on
+    # whatever's already open — verified live that the latter lands on
+    # run_turn (the bridge's own auto-instrumented span for this tool call
+    # is created on langsmith's background tracing thread, per Phase
+    # 5.0.1's own finding, so it's never "current" from in here), which
+    # would also silently overwrite itself if propose_cart fires more than
+    # once in the same turn (a plain revision, for instance).
+    with observability.get_tracer().start_as_current_span("tool.propose_cart") as span:
+        span.set_attribute("cart.item_count", len(items))
+        span.set_attribute("cart.estimated_total", estimated_total)
+
     cart: Cart = {
         "items": items,
         "estimated_total": estimated_total,
@@ -146,6 +158,9 @@ def confirm_cart_and_proceed(tool_call_id: Annotated[str, InjectedToolCallId]) -
     move things along — only when the customer's own words clearly
     approve what's already proposed with nothing left to negotiate.
     """
+    with observability.get_tracer().start_as_current_span("tool.confirm_cart_and_proceed") as span:
+        span.set_attribute("cart.confirmed", True)
+
     return Command(
         update={
             "cart_confirmed": True,

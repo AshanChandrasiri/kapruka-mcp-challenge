@@ -10,6 +10,7 @@ import asyncio
 
 from psycopg_pool import AsyncConnectionPool
 
+from src import observability
 from src.config import DATABASE_URL
 from src.db.conninfo import ipv4_conninfo
 
@@ -38,12 +39,18 @@ async def touch_thread(thread_id: str, phone_number: str) -> None:
     common case) or a never-before-seen one (a freshly generated one, or a
     client-supplied ID we've never seen) both land correctly in one
     statement.
+
+    Phase 5.0.3: a lighter span, mainly for timing this DB write rather
+    than for business attributes — thread_id/phone_number are already
+    covered as baggage on spans created within a turn_context anyway.
     """
-    pool = await _get_pool()
-    async with pool.connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                "INSERT INTO threads (thread_id, phone_number) VALUES (%s, %s) "
-                "ON CONFLICT (thread_id) DO UPDATE SET last_active_at = now()",
-                (thread_id, phone_number),
-            )
+    tracer = observability.get_tracer()
+    with tracer.start_as_current_span("db.touch_thread"):
+        pool = await _get_pool()
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "INSERT INTO threads (thread_id, phone_number) VALUES (%s, %s) "
+                    "ON CONFLICT (thread_id) DO UPDATE SET last_active_at = now()",
+                    (thread_id, phone_number),
+                )

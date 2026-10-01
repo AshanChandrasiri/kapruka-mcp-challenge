@@ -1701,6 +1701,429 @@ talks to Langfuse.
       auto-instrumented layer too — not just the deterministic pipeline it
       was originally scoped for.
 
+### Phase 5.0.2 — Handoff spans across agent transitions (built and verified live 2026-09-30)
+
+**Problem being fixed:** right now a handoff between agents can only be
+*inferred* from LangGraph node names in the trace tree (`_route_after_
+gift_picker`, etc.) — there's no span that states "agent A finished,
+agent B took over, and here's why."
+
+**Decision:** one manual span at each of the three real transition points
+in `orchestrator.py` — `gift_picker` → `checkout_info`, `checkout_info`
+→ `confirm`, and any `handoff_reason` hand-back to `gift_picker` — each
+carrying the actual business reason for the transition, not just the
+node name.
+
+- [x] Wrap each transition point's routing logic with
+      `get_tracer().start_as_current_span("handoff", ...)`, setting
+      `handoff.from_agent`/`handoff.to_agent`/`handoff.reason` before the
+      span closes.
+- [x] `handoff.reason` sourced from the state's own `handoff_reason`
+      field where one is present, else a fixed string naming the
+      deterministic trigger (e.g. `"cart_confirmed"`,
+      `"checkout_info_finalized"`). **`_handoff_to_gift_picker`'s
+      `from_agent` needed a small design decision not spelled out in the
+      plan's own wording:** it's a single node shared by BOTH
+      `_route_after_checkout_info` and `_route_after_confirm`, so it can't
+      hard-code which agent it came from. Resolved by reading
+      `state["stage"]` at the moment the node runs — still whatever it
+      was on entry into that turn's agent run, since `request_cart_revision`
+      never touches `stage` itself — mapping `"checkout_info"` ->
+      `"checkout_info_agent"` and `"confirm"` -> `"confirm_agent"`.
+
+#### Verification checklist
+- [x] A full order run end-to-end (the same scenario already exercised
+      for Phase 3.8.1's live verification) shows three handoff spans, in
+      the right order, each with a reason that matches what actually
+      happened in that conversation. **Verified live** (real Gemini + real
+      Kapruka MCP, stopped short of a real "yes" — same hard-rule boundary
+      as every checkout test in this codebase): a 7-turn conversation
+      (propose chocolates → confirm cart → mid-checkout-info request to
+      add a greeting card → re-propose → re-confirm → give all delivery
+      details → summary shown) produced **four** handoff spans (one more
+      than the plan's own "three" estimate, since this conversation
+      naturally included a revision cycle) in the exact right order, each
+      correct: `gift_picker`→`checkout_info_agent`/`cart_confirmed`,
+      `checkout_info_agent`→`gift_picker`/"Customer requested to add a
+      greeting card to the order." (the actual free-text reason, not a
+      generic placeholder), `gift_picker`→`checkout_info_agent`/
+      `cart_confirmed` again (the re-confirmation), then
+      `checkout_info_agent`→`confirm_agent`/`checkout_info_finalized`.
+      All four also confirmed nested under their own turn's `run_turn`
+      span (`parent_id` checked directly against each `run_turn` span's
+      own `span_id`, not assumed) with correct `phone_number`/`thread_id`
+      baggage present — same hand-written-span baggage behavior Phase
+      5.0.3 already established, unaffected by the langsmith-bridge
+      limitation from Phase 5.0.1. Test thread cleaned up after.
+
+### Phase 5.0.3 — Instrument the deterministic pipeline (built and verified live 2026-09-30)
+
+**Problem being fixed:** raw MCP client calls (`src/checkout/
+mcp_client.py`) and DB writes (`src/db/threads.py`, `src/checkout/
+order.py`, `src/checkout/compaction.py`) never go through LangChain's
+callback system, so none of the langsmith→OTel bridge reaches them —
+they're the one part of this app still completely untraced, auto or
+otherwise, despite `save_order` being the single spot where a wrong
+number gets permanently written.
+
+**Decision:** hand-wrap each with `get_tracer().start_as_current_span
+(...)`, the same pattern already used for `run_turn`'s own span — no new
+scaffolding needed, just more call sites.
+
+- [x] `mcp_client.py`: a span around each raw MCP call
+      (`kapruka_check_delivery`, `kapruka_create_order`), with
+      city/delivery-date/order-total attributes where relevant.
+      **Implemented one level more generic than the plan's own literal
+      per-tool wording:** rather than hand-writing a span at each of
+      `kapruka_check_delivery`/`kapruka_create_order`'s own call sites
+      (`src/checkout/delivery.py`/`src/checkout/order.py`), the span lives
+      once inside `call_kapruka_tool` itself — the one shared choke point
+      every raw MCP call already goes through (including
+      `kapruka_track_order`/`kapruka_list_delivery_cities` as a free
+      bonus). Attributes come from flattening the request `params`/parsed
+      response dict's own top-level scalar fields onto the span
+      (`_flatten_scalar_attrs`), plus one deliberate level into a nested
+      `summary` dict — exactly where `create_order`'s own response nests
+      its order total, satisfying "order-total attribute" without
+      hand-picking field names per tool. No manual error-status code
+      needed — `start_as_current_span`'s own default exception behavior
+      already covers a raised `KapurkaToolError`, same mechanism
+      `run_turn`'s span already relies on.
+- [x] `save_order`: a span carrying `order.total_amount`,
+      `order.currency`, `order.delivery_city` — genuinely worth having on
+      record given this is the one real financial write in the whole
+      system.
+- [x] `touch_thread`/`compact_thread`: lighter spans, mainly for timing
+      rather than business attributes.
+
+#### Verification checklist — verified live 2026-09-30, real Neon, no
+`kapruka_create_order` ever fired (hard rule intact — see below)
+- [x] A completed order shows spans for the create-order MCP call and
+      the `save_order` DB write, both correctly nested under that turn's
+      `run_turn` span — the deterministic pipeline is no longer a gap in
+      the trace tree. **Verified live in two separate, hard-rule-safe
+      pieces rather than one real end-to-end completed order** (an actual
+      `kapruka_create_order` call is never fired in this codebase's own
+      dev/test practice): (1) a real `kapruka_check_delivery` call via
+      `check_delivery_for_cart`, run inside a manually opened `run_turn`
+      span — confirmed live: `mcp.kapruka_check_delivery`'s `parent_id`
+      exactly matched `run_turn`'s own `span_id` (checked by direct
+      value comparison, not assumed from indentation), with correct
+      `mcp.request.city`/`delivery_date`/`product_id` and
+      `mcp.response.available`/`rate`/`currency` attributes, plus
+      `phone_number`/`thread_id` baggage correctly present on BOTH spans
+      (unlike the langsmith-bridge spans from Phase 5.0.1 — this
+      confirms baggage propagation works fine for this project's OWN
+      hand-written nested spans; the earlier gap was specific to
+      langsmith's background tracing thread, not a general limitation).
+      (2) `save_order` called directly with a fabricated `order_result`
+      (same safe pattern Phase 3.8's own verification used), also inside
+      a manually opened `run_turn` span — confirmed `db.save_order`'s
+      `parent_id` matched `run_turn`'s `span_id`, with correct
+      `order.total_amount`/`currency`/`delivery_city` attributes. Test
+      rows/threads cleaned up after.
+- [x] `touch_thread`/`compact_thread` spans confirmed present via a real
+      `run_turn` call (`db.touch_thread`) and a directly-invoked
+      `compact_thread` with a fabricated summary (`compaction.compact_thread`,
+      same safe pattern Phase 4's own compaction verification used) —
+      neither needed a real order to exercise.
+
+### Phase 5.0.4 — Correct failure/error marking (built and verified live 2026-09-30)
+
+**Problem being fixed:** confirmed live during Phase 5.0.1's own
+verification, with a deliberately broken model name — a failed LLM
+call's error text lands inside `gen_ai.completion` as unstructured JSON,
+but the span's own OTel `status` stays `OK`. Only the one hand-written
+`run_turn` span gets a correct `ERROR` status, via
+`start_as_current_span`'s own default exception handling. Right now
+"did anything fail in this turn" isn't a queryable fact on any of the
+auto-generated spans — someone has to read the embedded text by eye.
+
+**Decision:** a `SpanProcessor.on_end()` hook, installed alongside the
+existing `_BaggageSpanProcessor`, that inspects `gen_ai.completion` for
+the langsmith bridge's own error shape and corrects `status` before the
+span is exported — fixes this for every auto-generated span at once,
+not one call site at a time.
+
+**Both parts of the plan's own guessed mechanism turned out to be wrong
+once checked live, not just refined — worth flagging plainly rather than
+quietly swapping in a different implementation:**
+1. **The detection signal isn't `gen_ai.completion`.** A deliberately
+   broken model name showed a failed call's `gen_ai.completion` is just an
+   empty `{"generations": [[]], "llm_output": null, "run": null,
+   "type": "LLMResult"}` — no embedded error shape to parse at all. The
+   real, more precise, and more standard signal already sitting on the
+   span is a normal OTel `exception` **event** (the bridge already calls
+   the `record_exception()`-equivalent) — found by direct inspection
+   (a diagnostic `SpanProcessor.on_end` dumping every span's actual
+   `gen_ai.completion`/events), not assumed from the plan's own
+   description. It's also not just the one model-call span: the failure
+   propagates an `exception` event up through `ChatGoogleGenerativeAI`,
+   `model`, `LangGraph`, `intent_router`, and `concierge_orchestrator` —
+   every one of them left at `status: OK` regardless.
+2. **A plain `span.set_status(ERROR)` inside `on_end()` does not work at
+   all**, confirmed by reading the installed SDK source before writing
+   any code around it: `Span.set_status()` explicitly "ignore[s] future
+   calls if status is already set to OK" — a deliberate spec guard
+   against flip-flopping a final status. Since the bridge has already
+   called `set_status(OK)` (confirmed: the JSON shows a literal `"OK"`,
+   not `"UNSET"`, so this isn't merely defaulting), the public API
+   genuinely cannot correct it after the fact. `_ErrorDetectionSpanProcessor`
+   mutates `span._status` directly instead — a private-attribute
+   workaround, same category as `_console_safe_formatter`'s bytes
+   decoding from Phase 5.0.0/5.0.1, not a new pattern invented here.
+
+- [x] New processor, `_ErrorDetectionSpanProcessor`, added to
+      `configure()` alongside `_BaggageSpanProcessor` — **added BEFORE
+      the console-exporting `SimpleSpanProcessor`, deliberately, not
+      incidentally:** `SynchronousMultiSpanProcessor` calls every
+      processor's `on_end()` in add-order for the same span, so the
+      status correction has to land before the exporter's own `on_end()`
+      call serializes and prints it.
+- [x] Manual `record_exception()`/`set_status(ERROR)` added around the
+      new spans from Phase 5.0.2/5.0.3, since hand-written spans don't
+      get this automatically either — only `run_turn`'s
+      `start_as_current_span` usage does. **Narrower in practice than the
+      plan's own blanket wording, once checked span-by-span:** every
+      Phase 5.0.2/5.0.3 span except one lets its own exception propagate
+      naturally out of its `with start_as_current_span(...)` block, which
+      already triggers `start_as_current_span`'s own default
+      exception-recording behavior for free (the exact mechanism
+      `run_turn`'s span already relies on) — no manual code needed for
+      `handoff`, `mcp.{tool_name}`, or `db.save_order`/`db.touch_thread`.
+      The one genuine exception (literally): `compaction.compact_thread`
+      wraps a `try/except Exception: logger.exception(...)` that
+      deliberately swallows its own failure (a compaction failure must
+      never fail the customer's turn) — since nothing ever propagates out
+      of that `with` block, the default behavior never triggers, so this
+      is the one span that actually needed manual
+      `span.record_exception(exc)` + `span.set_status(Status(StatusCode.ERROR, ...))`
+      in its `except` clause (a normal `set_status()` call works fine
+      here, unlike the bridge-spans case above — this span was never set
+      to `OK` by anything else first, so the "already OK" guard never
+      applies).
+
+#### Verification checklist — verified live 2026-09-30
+- [x] Same deliberately-broken-model-name test as Phase 5.0.1, this time
+      confirming the span's own `status.status_code` shows `ERROR`, not
+      just the error text sitting inside `gen_ai.completion`. **Verified
+      live**: re-ran the identical Phase 5.0.1 test — `ChatGoogleGenerativeAI`,
+      `model`, `LangGraph`, `intent_router`, `run_turn`, and
+      `concierge_orchestrator` ALL now show `status_code: ERROR` (up from
+      only `run_turn` before this phase).
+- [x] No false positives on genuinely successful spans — **verified
+      live**: a normal `chitchat` turn's full span set (`db.touch_thread`,
+      `__start__`, `_route_from_start`, `model`, `ChatGoogleGenerativeAI`,
+      `extract_intent`, `_route_on_intent`, `chitchat_node`,
+      `intent_router`, `LangGraph`, `concierge_orchestrator`) was
+      completely unchanged from its pre-Phase-5.0.4 shape — all `OK`
+      (`run_turn`/`db.touch_thread` `UNSET`, as expected when nothing
+      failed).
+- [x] `compact_thread`'s own manual error-marking — **verified live** with
+      a simulated `adelete_thread` failure (a `FailingCheckpointer` stub,
+      not a real DB outage): `compaction.compact_thread`'s span correctly
+      showed `status_code: ERROR` with `description: "simulated DB
+      failure"` and an `exception` event, while the failure itself was
+      still safely swallowed (confirmed no exception propagated out of
+      `compact_thread` itself — same "never fail the customer's turn"
+      guarantee as before this phase, now just correctly visible in the
+      trace too).
+
+### Phase 5.0.5 — Domain-specific tool-call enrichment (built and verified live 2026-09-30)
+
+**Problem being fixed:** the tool spans exist and carry raw args/results,
+but nothing on them says anything about *this app* specifically — how
+many products a search actually returned, whether a cart was proposed
+versus confirmed, what a cart's real total came to.
+
+**Decision:** enrich the spans that already exist, in place, via
+`trace.get_current_span().set_attribute(...)` inside each `@tool`
+function — no new spans, cheap to add incrementally, same pattern as
+`run_turn`'s own `gift.intent` attribute.
+
+**The plan's own literal mechanism was checked live BEFORE writing the
+real implementation, and it doesn't do what it says — same category of
+finding as Phase 5.0.1/5.0.4's own background-thread discoveries, not a
+new problem invented here:** `trace.get_current_span()` called from
+inside a tool's own execution does NOT return the bridge's own
+auto-instrumented span for that tool call — confirmed by directly probing
+`propose_cart` with a monkeypatch that printed the current span's name at
+call time: it returned `run_turn`, not `propose_cart`. Root cause is the
+same one already documented for Phase 5.0.1: the bridge creates its own
+per-call spans on a background thread, so they're never "current" from
+the calling thread/task's own perspective. Following the plan literally
+would have (1) attached every one of these attributes to the whole
+`run_turn` span instead of the specific tool call, and (2) silently
+overwritten itself if the same tool fires more than once in one turn
+(e.g. a second search) — the second call's `set_attribute` on the same
+key would just replace the first, losing data. **Decision made instead:**
+give each of these its own small dedicated span, exactly the
+`mcp.{tool_name}`-per-call pattern Phase 5.0.3 already established for
+the raw MCP client — same actual outcome the plan wanted (attributes
+correlated to one specific call), just not literally "no new spans."
+
+**A second, separate finding while implementing
+`kapruka_search_products`/`kapruka_get_product` specifically:** these are
+remote MCP tools with no Python source in this codebase (loaded via
+`MultiServerMCPClient` in `src/gift_picker/agent.py`) — and, checked
+live, they return plain markdown TEXT by default, not the structured JSON
+`src/checkout/mcp_client.py`'s own raw client explicitly requests
+(`response_format: "json"`, a param the args schema exposed to
+`MultiServerMCPClient` doesn't even offer). `result_count`/`in_stock`
+aren't structured fields to read here — they're pulled out of the
+rendered markdown text with two small regexes
+(`_RESULT_COUNT_RE`/`_STOCK_LINE_RE`/`_PRODUCT_STOCK_RE` in
+`src/gift_picker/agent.py`).
+
+- [x] `kapruka_search_products`/`kapruka_get_product`: `result_count`,
+      `in_stock` where applicable. **Implemented via `_wrap_mcp_tool_with_span`**
+      (`src/gift_picker/agent.py`), which replaces each loaded MCP tool's
+      `.coroutine` with a version opening its own `tool.{name}` span
+      around the call. **A second real bug found live while verifying,
+      not anticipated:** `tool.coroutine`'s actual return shape differs
+      by call path — a direct `.ainvoke()` (e.g. in an isolated check)
+      returns a plain list of text blocks, but invoked for real through
+      the agent's own graph it returns a `(content, artifact)` TUPLE
+      instead (LangChain's `content_and_artifact` response shape). The
+      first implementation's fallback (`str(result)` for anything not a
+      list) stringified BOTH tuple halves together on the real
+      agent-driven path, silently DOUBLING every regex count
+      (`in_stock_count: 20` for a 10-result search, `result_count` still
+      correctly `10` since `.search()` only takes the first match, which
+      is exactly what exposed the mismatch) — an isolated direct
+      `.ainvoke()` test of the same tool did NOT reproduce this at all,
+      only a real agent-driven call did. Fixed by unwrapping a tuple
+      result to its first element before reading the content list.
+- [x] `propose_cart`: `cart.item_count`, `cart.estimated_total`.
+- [x] `confirm_cart_and_proceed`: `cart.confirmed: true`.
+
+#### Verification checklist — verified live 2026-09-30, real Gemini + real
+Kapruka MCP, test threads cleaned up after
+- [x] A full Gift-Picker conversation shows these attributes present on
+      the relevant spans in console output. **Verified live**, a real
+      3-turn conversation (search chocolates within budget → propose cart
+      → confirm) produced, after both bugs above were found and fixed:
+      `tool.kapruka_search_products` with correct matching
+      `result_count: 10`/`in_stock_count: 10`, `tool.kapruka_get_product`
+      with `in_stock: true`, `tool.propose_cart` with correct
+      `cart.item_count`/`cart.estimated_total` matching the actual
+      proposed cart, and `tool.confirm_cart_and_proceed` with
+      `cart.confirmed: true` — each on its own correctly-scoped span, not
+      smeared across `run_turn`.
+
+### Phase 5.1 — Environment-conditional export: console in dev, Langfuse Cloud in production (built and verified live 2026-09-30)
+
+**Problem being fixed:** two separate problems, neither solved by
+anything above:
+1. Every span currently carries the full raw prompt/completion text. In
+   production, whatever goes to stdout typically flows straight into
+   whatever log aggregator is in use — meaning every customer's exact
+   conversation content would silently end up sitting in the logging
+   system, unreviewed, just because that's where OTel happened to print
+   it.
+2. Nothing from Phase 5.0.0–5.0.5 is stored anywhere. It's all
+   ephemeral, per-terminal-session console output — there's no way to
+   ask "how long did turn X take" or "show every failed turn this week"
+   without reading raw JSON by eye.
+
+**Decision:** an environment variable chooses the exporter — console for
+local dev (unchanged from every phase so far), OTLP pointed at Langfuse
+**Cloud** for production. Cloud, not self-hosted: no Docker stack to run
+or maintain — sign up, create a project, get a public/secret key pair.
+
+Confirmed directly from Langfuse's own OpenTelemetry documentation, not
+assumed:
+- OTLP trace endpoint: `https://cloud.langfuse.com/api/public/otel/v1/
+  traces` (EU data region, Langfuse's default — `us.cloud.langfuse.com`
+  instead if the US region is ever preferred).
+- Auth: HTTP Basic — `Authorization: Basic <base64(public_key:
+  secret_key)>`, built once from the project's key pair. No separate
+  Langfuse SDK needed, since this app already speaks raw OTel end to
+  end.
+- **Langfuse's OTLP endpoint is HTTP/protobuf only — gRPC is not
+  supported.** This matters concretely: the generic
+  `opentelemetry-exporter-otlp` package installs the gRPC exporter by
+  default; the HTTP-specific one —
+  `opentelemetry-exporter-otlp-proto-http`, class `OTLPSpanExporter`
+  from `opentelemetry.exporter.otlp.proto.http.trace_exporter` — is the
+  one that actually works against Langfuse's endpoint.
+- `BatchSpanProcessor`, not `SimpleSpanProcessor`. Exporting one span at
+  a time, synchronously, on the calling thread — what
+  `SimpleSpanProcessor` does today — would add real network latency to
+  every single turn once there's an actual network destination.
+  Batching in the background is the whole reason `flush()` already
+  exists, and Phase 5.0.0's own docstring already called this "load-
+  bearing again the moment this moves to a batched, networked exporter"
+  — that moment is now.
+
+- [x] New env var, e.g. `APP_ENV` (`development` by default, `production`
+      as the opt-in) — read once inside `configure()`. **Read in
+      `src/config.py` with `.get()`, not a hard `os.environ[...]`
+      lookup** — same reasoning as `LANGFUSE_PUBLIC_KEY`/`SECRET_KEY`
+      below: the concierge itself must never fail to even start over a
+      missing/misconfigured observability backend.
+- [x] `development`: unchanged from every prior phase —
+      `SimpleSpanProcessor(ConsoleSpanExporter(formatter=
+      _console_safe_formatter))`.
+- [x] `production`: `BatchSpanProcessor(OTLPSpanExporter(endpoint=...,
+      headers={"Authorization": f"Basic {auth}"}))`, with the auth
+      string built once from `LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY`
+      env vars. Endpoint built from a third env var,
+      `LANGFUSE_BASE_URL` (defaulting to `https://cloud.langfuse.com`,
+      the EU region) plus `/api/public/otel/v1/traces` — not hard-coded
+      to one region, since the customer's own `.env` specified the US
+      region (`us.cloud.langfuse.com`) when setting this up.
+- [x] New dependency: `opentelemetry-exporter-otlp-proto-http`. **Already
+      installed** — pulled in transitively by `langsmith[otel]` back in
+      Phase 5.0.0 (confirmed via `pip show`), no `requirements.txt`
+      change needed.
+- [x] `_BaggageSpanProcessor` (Phase 5.0.0) and the error-detection
+      processor (Phase 5.0.4) apply in both environments unchanged —
+      only the export destination changes, not what gets attached to a
+      span before it's exported.
+- [x] `_console_safe_formatter`'s bytes-decoding workaround (Phase
+      5.0.0) stays console-only and needs no production equivalent — the
+      OTLP exporter serializes spans itself, never going through
+      `ConsoleSpanExporter.to_json()` at all.
+
+#### Verification checklist — verified live 2026-09-30 against the
+customer's own real Langfuse Cloud project, test threads cleaned up after
+- [x] With `APP_ENV` unset (or `development`), behavior is byte-for-byte
+      unchanged from every prior phase's own verification — console
+      output, nothing silently different. **Verified live**: a real turn
+      with `APP_ENV` unset produced the identical `run_turn` span/console
+      shape as every prior Phase 5.0.x check, zero export exceptions.
+- [x] With `APP_ENV=production` and real Langfuse keys set, a full turn
+      appears in the Langfuse Cloud UI's trace list within a few
+      seconds, showing the same span tree, token counts, and — once
+      Phase 5.0.2–5.0.5 have landed — handoff spans and the domain
+      attributes, with no further code changes beyond the exporter swap
+      itself, since it's the same span data just routed somewhere
+      queryable. **Verified live, at the HTTP level rather than by eye in
+      the browser** (no browser access from here): patched
+      `OTLPSpanExporter.export` directly and confirmed
+      `SpanExportResult.SUCCESS` for every batch sent (1, 2, and 7 spans
+      across three batches for one real turn) — traced into the
+      exporter's own source to confirm `SUCCESS` specifically means the
+      underlying HTTP client's response was checked and accepted, not
+      merely "no exception was raised." Real credentials from the
+      customer's own `.env`, real endpoint
+      (`https://us.cloud.langfuse.com/api/public/otel/v1/traces`,
+      matching their configured `LANGFUSE_BASE_URL`). **Visual
+      confirmation in the Langfuse Cloud UI itself is still worth doing
+      on the customer's own end** — flagging this as the one part of the
+      checklist not literally verifiable from here.
+- [x] With `APP_ENV=production` and missing/invalid Langfuse keys,
+      confirm the failure mode is a quietly dropped export (matching
+      OTel's own default "log and continue" behavior), not a crash — a
+      broken observability backend must never be able to take the actual
+      concierge down with it. **Verified live** with deliberately wrong
+      `LANGFUSE_PUBLIC_KEY`/`SECRET_KEY` values: the exporter logged
+      `"Failed to export spans batch code: 401, reason: Unauthorized"`
+      for every batch, but the actual customer-facing turn completed and
+      replied normally, and `flush()` returned without raising —
+      confirming a broken Langfuse connection can never take the
+      concierge itself down.
 ## Phase 6 — Track-order branch
 
 - [ ] Order-number extraction (ask if missing) → `kapruka_track_order` →

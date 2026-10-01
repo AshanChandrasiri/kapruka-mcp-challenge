@@ -27,6 +27,9 @@ import logging
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from opentelemetry.trace import Status, StatusCode
+
+from src import observability
 
 logger = logging.getLogger(__name__)
 
@@ -43,17 +46,31 @@ async def compact_thread(
     real node name to attribute the write to, not one with any special
     meaning here since there's no prior checkpoint left to reconcile
     against after adelete_thread.
+
+    Phase 5.0.3: a lighter span, mainly for timing. Phase 5.0.4: the
+    try/except below is deliberately left swallowing its exception (see
+    this module's own docstring on why a compaction failure must never
+    fail the turn) — since the exception never propagates out of the
+    `with` block, `start_as_current_span`'s own default exception handling
+    never triggers the way it does for `run_turn`'s span, so this is the
+    one hand-written span from Phase 5.0.2/5.0.3 that genuinely needs a
+    manual `record_exception`/`set_status(ERROR)` call (the others all let
+    their exception propagate naturally and already get this for free).
     """
+    tracer = observability.get_tracer()
     thread_id = config["configurable"]["thread_id"]
-    try:
-        await checkpointer.adelete_thread(thread_id)
-        await graph.aupdate_state(
-            config,
-            {
-                "messages": [AIMessage(content=summary_text)],
-                "order_summary_for_compaction": None,
-            },
-            as_node="confirm_agent",
-        )
-    except Exception:
-        logger.exception("Post-order history compaction failed for thread %s", thread_id)
+    with tracer.start_as_current_span("compaction.compact_thread") as span:
+        try:
+            await checkpointer.adelete_thread(thread_id)
+            await graph.aupdate_state(
+                config,
+                {
+                    "messages": [AIMessage(content=summary_text)],
+                    "order_summary_for_compaction": None,
+                },
+                as_node="confirm_agent",
+            )
+        except Exception as exc:
+            logger.exception("Post-order history compaction failed for thread %s", thread_id)
+            span.record_exception(exc)
+            span.set_status(Status(StatusCode.ERROR, str(exc)))

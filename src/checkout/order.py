@@ -14,6 +14,7 @@ import asyncio
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
+from src import observability
 from src.checkout.mcp_client import call_kapruka_tool
 from src.config import DATABASE_URL
 from src.db.conninfo import ipv4_conninfo
@@ -72,55 +73,67 @@ async def save_order(phone_number: str, cart: Cart, checkout_info: dict, order_r
     confirmed against a live response so far (Phase 3); the other fields
     are trusted the same cautious way _item_price already handles
     inconsistent price shapes elsewhere in this codebase.
+
+    Phase 5.0.3: wrapped in its own span — this is the single spot in the
+    whole system where a wrong number gets permanently written, genuinely
+    worth having on record, distinct from the MCP-call span that already
+    wraps kapruka_create_order itself one level up (src/checkout/flow.py's
+    complete_order calls create_order, then this).
     """
     pool = await _get_pool()
     summary = order_result.get("summary", {})
     total_amount = summary.get("grand_total", cart["estimated_total"])
-    async with pool.connection() as conn:
-        async with conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(
-                "INSERT INTO orders (phone_number, total_amount, items_total, delivery_fee, "
-                "addons_total, currency, delivery_city, delivery_date, delivery_address, "
-                "recipient_name, recipient_phone, sender_name, payment_url, "
-                "payment_url_expires_at, kapruka_order_ref, status) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
-                "now() + interval '60 minutes', %s, %s) "
-                "RETURNING id",
-                (
-                    phone_number,
-                    total_amount,
-                    summary.get("items_total"),
-                    summary.get("delivery_fee"),
-                    summary.get("addons_total"),
-                    summary.get("currency", "LKR"),
-                    checkout_info["delivery_city"],
-                    checkout_info["delivery_date"],
-                    checkout_info["delivery_address"],
-                    checkout_info["recipient_name"],
-                    checkout_info["recipient_phone"],
-                    checkout_info["sender_name"],
-                    order_result.get("checkout_url"),
-                    order_result.get("order_ref"),
-                    "pending_payment",
-                ),
-            )
-            order_id = (await cur.fetchone())["id"]
+    tracer = observability.get_tracer()
+    with tracer.start_as_current_span("db.save_order") as span:
+        span.set_attribute("order.total_amount", float(total_amount))
+        span.set_attribute("order.currency", summary.get("currency", "LKR"))
+        span.set_attribute("order.delivery_city", checkout_info["delivery_city"])
 
-            for item in cart["items"]:
+        async with pool.connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
                 await cur.execute(
-                    "INSERT INTO order_products (order_id, kapruka_product_id, product_name, "
-                    "product_url, product_image_url, unit_price, quantity) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    "INSERT INTO orders (phone_number, total_amount, items_total, delivery_fee, "
+                    "addons_total, currency, delivery_city, delivery_date, delivery_address, "
+                    "recipient_name, recipient_phone, sender_name, payment_url, "
+                    "payment_url_expires_at, kapruka_order_ref, status) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
+                    "now() + interval '60 minutes', %s, %s) "
+                    "RETURNING id",
                     (
-                        order_id,
-                        item["product_id"],
-                        item.get("name", item["product_id"]),
-                        item.get("url"),
-                        item.get("image_url"),
-                        item.get("price"),
-                        item.get("quantity", 1),
+                        phone_number,
+                        total_amount,
+                        summary.get("items_total"),
+                        summary.get("delivery_fee"),
+                        summary.get("addons_total"),
+                        summary.get("currency", "LKR"),
+                        checkout_info["delivery_city"],
+                        checkout_info["delivery_date"],
+                        checkout_info["delivery_address"],
+                        checkout_info["recipient_name"],
+                        checkout_info["recipient_phone"],
+                        checkout_info["sender_name"],
+                        order_result.get("checkout_url"),
+                        order_result.get("order_ref"),
+                        "pending_payment",
                     ),
                 )
+                order_id = (await cur.fetchone())["id"]
+
+                for item in cart["items"]:
+                    await cur.execute(
+                        "INSERT INTO order_products (order_id, kapruka_product_id, product_name, "
+                        "product_url, product_image_url, unit_price, quantity) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                        (
+                            order_id,
+                            item["product_id"],
+                            item.get("name", item["product_id"]),
+                            item.get("url"),
+                            item.get("image_url"),
+                            item.get("price"),
+                            item.get("quantity", 1),
+                        ),
+                    )
 
 
 async def track_order_once(order_ref: str) -> dict | None:
